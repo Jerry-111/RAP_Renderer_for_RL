@@ -1210,10 +1210,6 @@ bool should_control_agent(Drive *env, int agent_idx) {
 
     Entity *entity = &env->entities[agent_idx];
 
-    // TODO: Move this elsewhere or remove
-    entity->width *= 0.7f;
-    entity->length *= 0.7f;
-
     if (env->control_mode == CONTROL_SDC_ONLY) {
         return agent_idx == env->sdc_track_index;
     }
@@ -1261,7 +1257,7 @@ void set_active_agents(Drive *env) {
     env->active_agent_count = 0;        // Policy-controlled agents
     env->static_agent_count = 0;        // Non-moving background agents
     env->expert_static_agent_count = 0; // Expert replay agents (non-controlled)
-    env->num_actors = 1;                // Total agents created (there is always the SDC)
+    env->num_actors = 0;                // Total agents created (there is always the SDC)
 
     int active_agent_indices[MAX_AGENTS];
     int static_agent_indices[MAX_AGENTS];
@@ -1271,12 +1267,15 @@ void set_active_agents(Drive *env) {
         env->num_agents = MAX_AGENTS;
     }
 
-    // Create and initialize the SDC first to ensure we always have at least
-    // one controllable agent.
+    // If we have a SDC index (WOMD), initialize it first:
     int sdc_index = env->sdc_track_index;
-    active_agent_indices[0] = sdc_index;
-    env->active_agent_count++;
-    env->entities[sdc_index].active_agent = 1;
+
+    if (sdc_index >= 0) {
+        active_agent_indices[0] = sdc_index;
+        env->num_actors++;
+        env->active_agent_count++;
+        env->entities[sdc_index].active_agent = 1;
+    }
 
     // Iterate through entities to find agents to create and/or control
     for (int i = 0; i < env->num_objects && env->num_actors < MAX_AGENTS; i++) {
@@ -1693,11 +1692,12 @@ void c_get_global_agent_state(Drive *env, float *x_out, float *y_out, float *z_o
 }
 
 void c_get_global_ground_truth_trajectories(Drive *env, float *x_out, float *y_out, float *z_out, float *heading_out,
-                                            int *valid_out, int *id_out, int *scenario_id_out) {
+                                            int *valid_out, int *id_out, int *is_vehicle_out, int *scenario_id_out) {
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
         Entity *agent = &env->entities[agent_idx];
         id_out[i] = get_track_id_or_placeholder(env, agent_idx);
+        is_vehicle_out[i] = agent->type == VEHICLE;
         scenario_id_out[i] = agent->scenario_id;
 
         for (int t = env->init_steps; t < agent->array_size; t++) {
