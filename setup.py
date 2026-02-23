@@ -14,16 +14,18 @@ import shutil
 import sys
 
 from setuptools.command.build_ext import build_ext
-from torch.utils import cpp_extension
-from torch.utils.cpp_extension import (
-    CppExtension,
-    CUDAExtension,
-)
 
 # Build with DEBUG=1 to enable debug symbols
 DEBUG = os.getenv("DEBUG", "0") == "1"
 NO_OCEAN = os.getenv("NO_OCEAN", "0") == "1"
 NO_TRAIN = os.getenv("NO_TRAIN", "0") == "1"
+
+if not NO_TRAIN:
+    from torch.utils import cpp_extension
+    from torch.utils.cpp_extension import (
+        CppExtension,
+        CUDAExtension,
+    )
 
 # Build raylib for your platform
 RAYLIB_URL = "https://github.com/raysan5/raylib/releases/download/5.5/"
@@ -209,8 +211,9 @@ class BuildExt(build_ext):
             self.distribution.command_options["build_torch"] = build_ext_opts.copy()
             self.distribution.command_options["build_c"] = build_ext_opts.copy()
 
-        # Run the torch and C builds (which will handle copying when inplace is set)
-        self.run_command("build_torch")
+        # Build torch extension only in training-enabled mode.
+        if not NO_TRAIN:
+            self.run_command("build_torch")
         self.run_command("build_c")
 
 
@@ -220,10 +223,15 @@ class CBuildExt(build_ext):
         super().run(*args, **kwargs)
 
 
-class TorchBuildExt(cpp_extension.BuildExtension):
-    def run(self):
-        self.extensions = [e for e in self.extensions if e.name == "pufferlib._C"]
-        super().run()
+if not NO_TRAIN:
+    class TorchBuildExt(cpp_extension.BuildExtension):
+        def run(self):
+            self.extensions = [e for e in self.extensions if e.name == "pufferlib._C"]
+            super().run()
+else:
+    class TorchBuildExt(build_ext):
+        def run(self, *args, **kwargs):
+            return
 
 
 RAYLIB_A = f"{RAYLIB_NAME}/lib/libraylib.a"
