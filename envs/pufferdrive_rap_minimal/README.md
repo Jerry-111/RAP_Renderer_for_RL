@@ -7,6 +7,10 @@ This folder creates one reproducible Python environment for:
 
 It is intentionally minimal and avoids deep RAP/nuPlan setup.
 
+The RAP renderer is vendored in this repo at:
+
+- `third_party/RAP/process_data/helpers/renderer.py`
+
 ---
 
 ## Files
