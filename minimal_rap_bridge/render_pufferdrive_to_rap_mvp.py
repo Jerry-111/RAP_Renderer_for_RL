@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import struct
 import shutil
 import sys
 import tempfile
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -43,6 +46,19 @@ class BridgeConfig:
     control_mode: str
     init_mode: str
     max_controlled_agents: int
+    goal_behavior: int
+    action_source: str
+    policy_model_path: Path
+    policy_device: str
+    policy_name: str
+    policy_input_size: int
+    policy_hidden_size: int
+    use_rnn: bool
+    rnn_name: str | None
+    rnn_input_size: int
+    rnn_hidden_size: int
+    policy_deterministic: bool
+    box_source: str
     single_env_mode: str
     write_video: bool
     save_frames: bool
@@ -75,7 +91,12 @@ def parse_args() -> BridgeConfig:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--map-dir", type=str, default="resources/drive/binaries")
     parser.add_argument("--num-maps", type=int, default=1)
-    parser.add_argument("--num-agents", type=int, default=64)
+    parser.add_argument(
+        "--num-agents",
+        type=int,
+        default=4096,
+        help="Requested controlled-agent budget. With --single-env-mode auto_max, a large value auto-selects the max single-scene agent count.",
+    )
     parser.add_argument("--episode-length", type=int, default=120)
     parser.add_argument("--full-episode", action="store_true", help="Render full episode_length frames")
     parser.add_argument(
@@ -100,6 +121,57 @@ def parse_args() -> BridgeConfig:
         choices=["create_all_valid", "create_only_controlled"],
     )
     parser.add_argument("--max-controlled-agents", type=int, default=128)
+    parser.add_argument(
+        "--goal-behavior",
+        type=int,
+        default=0,
+        choices=[0, 1, 2],
+        help="0=respawn, 1=generate_new_goals, 2=stop",
+    )
+    parser.add_argument(
+        "--action-source",
+        type=str,
+        default="neutral",
+        choices=["neutral", "policy"],
+        help="How to produce env actions: neutral baseline or PyTorch policy inference",
+    )
+    parser.add_argument(
+        "--policy-model-path",
+        type=Path,
+        default=Path("pufferlib/resources/drive/pufferdrive_weights.pt"),
+        help="Path to a PyTorch checkpoint used when --action-source policy",
+    )
+    parser.add_argument(
+        "--policy-device",
+        type=str,
+        default="auto",
+        help="PyTorch device for inference: auto/cpu/cuda[:id]",
+    )
+    parser.add_argument("--policy-name", type=str, default="Drive", help="Policy class from pufferlib.ocean.torch")
+    parser.add_argument("--policy-input-size", type=int, default=64)
+    parser.add_argument("--policy-hidden-size", type=int, default=256)
+    parser.add_argument(
+        "--use-rnn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wrap policy with recurrent module",
+    )
+    parser.add_argument("--rnn-name", type=str, default="Recurrent", help="RNN wrapper class from pufferlib.ocean.torch")
+    parser.add_argument("--rnn-input-size", type=int, default=256)
+    parser.add_argument("--rnn-hidden-size", type=int, default=256)
+    parser.add_argument(
+        "--policy-deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use argmax/mean actions instead of sampling",
+    )
+    parser.add_argument(
+        "--box-source",
+        type=str,
+        default="auto",
+        choices=["auto", "sim", "map_replay"],
+        help="Actor boxes for RAP renderer: sim=active agents only, map_replay=replay boxes from map trajectories, auto=map_replay for control_sdc_only else sim",
+    )
     parser.add_argument(
         "--single-env-mode",
         type=str,
@@ -158,6 +230,13 @@ def parse_args() -> BridgeConfig:
         raise ValueError("--max-scenes must be > 0 when provided")
     if args.replay_all_scenes and args.num_maps != 1:
         raise ValueError("--replay-all-scenes currently requires --num-maps 1")
+    if args.action_source == "policy":
+        if args.policy_input_size <= 0 or args.policy_hidden_size <= 0:
+            raise ValueError("--policy-input-size and --policy-hidden-size must be > 0")
+        if args.use_rnn and (args.rnn_input_size <= 0 or args.rnn_hidden_size <= 0):
+            raise ValueError("--rnn-input-size and --rnn-hidden-size must be > 0 when --use-rnn")
+        if not args.policy_model_path.exists():
+            raise FileNotFoundError(f"Policy checkpoint not found: {args.policy_model_path}")
 
     return BridgeConfig(
         out_dir=args.out_dir,
@@ -173,6 +252,19 @@ def parse_args() -> BridgeConfig:
         control_mode=args.control_mode,
         init_mode=args.init_mode,
         max_controlled_agents=args.max_controlled_agents,
+        goal_behavior=args.goal_behavior,
+        action_source=args.action_source,
+        policy_model_path=args.policy_model_path,
+        policy_device=args.policy_device,
+        policy_name=args.policy_name,
+        policy_input_size=args.policy_input_size,
+        policy_hidden_size=args.policy_hidden_size,
+        use_rnn=args.use_rnn,
+        rnn_name=args.rnn_name if args.use_rnn else None,
+        rnn_input_size=args.rnn_input_size,
+        rnn_hidden_size=args.rnn_hidden_size,
+        policy_deterministic=args.policy_deterministic,
+        box_source=args.box_source,
         single_env_mode=args.single_env_mode,
         write_video=args.write_video,
         save_frames=args.save_frames,
@@ -309,6 +401,144 @@ def build_scenario(
     }
 
 
+def build_scenario_from_boxes(
+    ego_heading: float,
+    map_features: Dict[str, Dict[str, np.ndarray]],
+    gt_boxes_world: np.ndarray,
+    gt_names: np.ndarray,
+) -> Dict:
+    return {
+        "ego_heading": float(ego_heading),
+        "traffic_lights": [],
+        "map_features": map_features,
+        "anns": {
+            "gt_boxes_world": gt_boxes_world,
+            "gt_names": gt_names,
+        },
+    }
+
+
+def _read_exact(fh, nbytes: int) -> bytes:
+    data = fh.read(nbytes)
+    if len(data) != nbytes:
+        raise EOFError(f"Unexpected EOF while reading {nbytes} bytes")
+    return data
+
+
+def load_map_replay_objects(map_bin_path: Path) -> Dict[str, object]:
+    """Load actor trajectories from a WOMD binary map for renderer-side replay boxes."""
+    objects: List[Dict[str, object]] = []
+    with map_bin_path.open("rb") as fh:
+        _scenario_id = _read_exact(fh, 16)
+        sdc_track_index = struct.unpack("i", _read_exact(fh, 4))[0]
+        tracks_to_predict_count = struct.unpack("i", _read_exact(fh, 4))[0]
+        if tracks_to_predict_count > 0:
+            _read_exact(fh, 4 * tracks_to_predict_count)
+
+        num_objects = struct.unpack("i", _read_exact(fh, 4))[0]
+        num_roads = struct.unpack("i", _read_exact(fh, 4))[0]
+
+        for obj_idx in range(num_objects):
+            _map_id = struct.unpack("i", _read_exact(fh, 4))[0]
+            obj_type = struct.unpack("i", _read_exact(fh, 4))[0]
+            obj_id = struct.unpack("i", _read_exact(fh, 4))[0]
+            array_size = struct.unpack("i", _read_exact(fh, 4))[0]
+
+            x = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.float32).copy()
+            y = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.float32).copy()
+            z = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.float32).copy()
+            _vx = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.float32)
+            _vy = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.float32)
+            _vz = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.float32)
+            heading = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.float32).copy()
+            valid = np.frombuffer(_read_exact(fh, 4 * array_size), dtype=np.int32).copy()
+
+            width, length, _height = struct.unpack("fff", _read_exact(fh, 12))
+            _goal_x, _goal_y, _goal_z = struct.unpack("fff", _read_exact(fh, 12))
+            _mark_as_expert = struct.unpack("i", _read_exact(fh, 4))[0]
+
+            objects.append(
+                {
+                    "track_index": obj_idx,
+                    "type": int(obj_type),
+                    "id": int(obj_id),
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                    "heading": heading,
+                    "valid": valid,
+                    "length": float(length),
+                    "width": float(width),
+                }
+            )
+
+        # Skip road records to keep parser aligned.
+        for _ in range(num_roads):
+            _map_id = struct.unpack("i", _read_exact(fh, 4))[0]
+            _road_type = struct.unpack("i", _read_exact(fh, 4))[0]
+            _road_id = struct.unpack("i", _read_exact(fh, 4))[0]
+            size = struct.unpack("i", _read_exact(fh, 4))[0]
+            _read_exact(fh, 4 * size * 3)  # x, y, z arrays
+            _read_exact(fh, 12)  # width, length, height
+            _read_exact(fh, 12)  # goal xyz
+            _read_exact(fh, 4)  # mark_as_expert
+
+    return {"sdc_track_index": int(sdc_track_index), "objects": objects}
+
+
+def build_boxes_from_map_replay(
+    replay_data: Dict[str, object],
+    frame_idx: int,
+    ego_x: float,
+    ego_y: float,
+    ego_z: float,
+    include_ego_box: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    objects = replay_data["objects"]
+    sdc_track_index = int(replay_data["sdc_track_index"])
+    boxes: List[List[float]] = []
+    names: List[str] = []
+
+    for obj in objects:
+        track_index = int(obj["track_index"])
+        if (not include_ego_box) and track_index == sdc_track_index:
+            continue
+
+        arr_n = int(obj["x"].shape[0])
+        if arr_n == 0:
+            continue
+        t = min(frame_idx, arr_n - 1)
+        if int(obj["valid"][t]) != 1:
+            continue
+
+        length = float(obj["length"])
+        width = float(obj["width"])
+        if length <= 0.0 or width <= 0.0:
+            continue
+
+        x = float(obj["x"][t])
+        y = float(obj["y"][t])
+        z = float(obj["z"][t])
+        heading = float(obj["heading"][t])
+        if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z) and np.isfinite(heading)):
+            continue
+
+        boxes.append([x - ego_x, y - ego_y, z - ego_z, length, width, 1.6, heading])
+        obj_type = int(obj["type"])
+        if obj_type == 1:
+            names.append("vehicle")
+        elif obj_type == 2:
+            names.append("pedestrian")
+        elif obj_type == 3:
+            names.append("cyclist")
+        else:
+            names.append("agent")
+
+    if not boxes:
+        return np.zeros((0, 7), dtype=np.float32), np.array([], dtype=object)
+    return np.array(boxes, dtype=np.float32), np.array(names, dtype=object)
+
+
 def validate_action_contract(env: Drive, actions: np.ndarray) -> None:
     if actions.shape != env.actions.shape:
         raise ValueError(f"Action shape mismatch: expected {env.actions.shape}, got {actions.shape}")
@@ -328,6 +558,174 @@ def make_neutral_actions(env: Drive) -> np.ndarray:
     actions = np.full(env.actions.shape, 45, dtype=env.actions.dtype)
     validate_action_contract(env, actions)
     return actions
+
+
+def resolve_torch_device(requested: str) -> str:
+    if requested != "auto":
+        return requested
+
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def extract_state_dict(checkpoint: object) -> Dict[str, object]:
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "policy_state_dict"):
+            nested = checkpoint.get(key)
+            if isinstance(nested, dict):
+                checkpoint = nested
+                break
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)}")
+    return {str(k): v for k, v in checkpoint.items()}
+
+
+def strip_module_prefix(state_dict: Dict[str, object]) -> Dict[str, object]:
+    cleaned: Dict[str, object] = {}
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            cleaned[key[len("module.") :]] = value
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+class ActionSource:
+    def next_actions(self, obs: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def on_step_result(self, terminals: np.ndarray, truncations: np.ndarray) -> None:
+        del terminals, truncations
+
+    def mode_label(self) -> str:
+        raise NotImplementedError
+
+
+class NeutralActionSource(ActionSource):
+    def __init__(self, env: Drive):
+        self.actions = make_neutral_actions(env)
+
+    def next_actions(self, obs: np.ndarray) -> np.ndarray:
+        del obs
+        return self.actions
+
+    def mode_label(self) -> str:
+        return "neutral"
+
+
+class PolicyActionSource(ActionSource):
+    def __init__(self, cfg: BridgeConfig, env: Drive):
+        try:
+            import torch
+            import pufferlib.pytorch as puffer_torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "Policy action source requires PyTorch and pufferlib.pytorch. "
+                "Install project deps in your active environment."
+            ) from exc
+
+        self.torch = torch
+        self.sample_logits = puffer_torch.sample_logits
+        self.env = env
+        self.action_shape = env.actions.shape
+        self.action_dtype = env.actions.dtype
+        self.policy_deterministic = cfg.policy_deterministic
+        self.use_rnn = cfg.use_rnn
+
+        device_str = resolve_torch_device(cfg.policy_device)
+        if device_str.startswith("cuda") and (not torch.cuda.is_available()):
+            raise RuntimeError(
+                "Requested CUDA inference but torch.cuda.is_available() is False. "
+                "GPU device files or permissions are not usable in this runtime."
+            )
+        self.device = torch.device(device_str)
+
+        torch_module = importlib.import_module("pufferlib.ocean.torch")
+        policy_cls = getattr(torch_module, cfg.policy_name)
+        policy = policy_cls(env, input_size=cfg.policy_input_size, hidden_size=cfg.policy_hidden_size)
+
+        if self.use_rnn:
+            if cfg.rnn_name is None:
+                raise ValueError("--rnn-name must be set when --use-rnn")
+            rnn_cls = getattr(torch_module, cfg.rnn_name)
+            policy = rnn_cls(env, policy, input_size=cfg.rnn_input_size, hidden_size=cfg.rnn_hidden_size)
+
+        self.policy = policy.to(self.device)
+        self.policy.eval()
+
+        checkpoint = torch.load(cfg.policy_model_path, map_location=self.device)
+        state_dict = strip_module_prefix(extract_state_dict(checkpoint))
+        missing, unexpected = self.policy.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Checkpoint/policy mismatch. "
+                f"missing_keys={missing[:8]} unexpected_keys={unexpected[:8]} "
+                "(showing up to 8 each)."
+            )
+
+        self.state: Dict[str, object] = {}
+        if self.use_rnn:
+            num_agents = int(env.num_agents)
+            hidden_size = int(self.policy.hidden_size)
+            self.state = {
+                "lstm_h": torch.zeros(num_agents, hidden_size, device=self.device),
+                "lstm_c": torch.zeros(num_agents, hidden_size, device=self.device),
+            }
+
+    def _deterministic_actions(self, logits: object) -> object:
+        if isinstance(logits, self.torch.distributions.Normal):
+            return logits.mean
+        if isinstance(logits, self.torch.Tensor):
+            return logits.argmax(dim=-1, keepdim=True)
+        # Multi-discrete tuple/list of tensors.
+        return self.torch.stack([head.argmax(dim=-1) for head in logits], dim=1)
+
+    def next_actions(self, obs: np.ndarray) -> np.ndarray:
+        with self.torch.no_grad():
+            obs_tensor = self.torch.as_tensor(obs, device=self.device)
+            logits, _ = self.policy.forward_eval(obs_tensor, self.state if self.use_rnn else None)
+
+            if self.policy_deterministic:
+                actions_tensor = self._deterministic_actions(logits)
+            else:
+                actions_tensor, _, _ = self.sample_logits(logits)
+
+            actions = actions_tensor.detach().cpu().numpy().reshape(self.action_shape)
+            if isinstance(logits, self.torch.distributions.Normal):
+                actions = np.clip(actions, self.env.single_action_space.low, self.env.single_action_space.high)
+            actions = actions.astype(self.action_dtype, copy=False)
+            return actions
+
+    def on_step_result(self, terminals: np.ndarray, truncations: np.ndarray) -> None:
+        if not self.use_rnn:
+            return
+        done = np.asarray(terminals).astype(bool) | np.asarray(truncations).astype(bool)
+        if not done.any():
+            return
+        done_tensor = self.torch.as_tensor(done, device=self.device)
+        self.state["lstm_h"][done_tensor] = 0
+        self.state["lstm_c"][done_tensor] = 0
+
+    def mode_label(self) -> str:
+        mode = "policy"
+        if self.policy_deterministic:
+            mode += "_deterministic"
+        if self.use_rnn:
+            mode += "_rnn"
+        mode += f"_{self.device.type}"
+        return mode
+
+
+def create_action_source(cfg: BridgeConfig, env: Drive) -> ActionSource:
+    if cfg.action_source == "neutral":
+        return NeutralActionSource(env)
+    return PolicyActionSource(cfg, env)
 
 
 def save_frame_images(out_dir: Path, frame_idx: int, rendered: Dict[str, np.ndarray]) -> None:
@@ -384,6 +782,7 @@ def _create_env(cfg: BridgeConfig, num_agents: int) -> Drive:
         control_mode=cfg.control_mode,
         init_mode=cfg.init_mode,
         max_controlled_agents=cfg.max_controlled_agents,
+        goal_behavior=cfg.goal_behavior,
         resample_frequency=0,
         report_interval=max(cfg.frames, 1),
     )
@@ -403,6 +802,18 @@ def create_single_scene_env(cfg: BridgeConfig) -> tuple[Drive, int]:
                 "Use --single-env-mode auto_max to auto-select the largest single-scene agent count."
             )
         return env, requested
+
+    # Fast path: in control_sdc_only, a single scene has one policy-controlled actor (SDC).
+    # Probing large requested num_agents values is expensive and unnecessary here.
+    if cfg.control_mode == "control_sdc_only":
+        env = _create_env(cfg, 1)
+        if int(env.num_envs) != 1:
+            env.close()
+            raise RuntimeError(
+                f"control_sdc_only expected num_envs==1 with num_agents=1, got num_envs={env.num_envs}. "
+                "Check map validity and control/init settings."
+            )
+        return env, 1
 
     # auto_max mode: choose the largest num_agents <= requested with num_envs == 1.
     low, high = 1, requested
@@ -498,7 +909,15 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
 
         render_width, render_height = 1920, 1120
         renderer = ScenarioRenderer(camera_channel_list=cfg.cameras, width=render_width, height=render_height)
-        neutral_actions = make_neutral_actions(env)
+        action_source = create_action_source(cfg, env)
+        obs = np.array(env.observations, copy=True)
+        resolved_box_source = cfg.box_source
+        if resolved_box_source == "auto":
+            resolved_box_source = "map_replay" if cfg.control_mode == "control_sdc_only" else "sim"
+
+        replay_data = None
+        if resolved_box_source == "map_replay":
+            replay_data = load_map_replay_objects(scene_source)
 
         if cfg.write_video:
             video_writers = open_video_writers(
@@ -521,10 +940,22 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             f"single_env_mode={cfg.single_env_mode}, num_agents(requested={cfg.num_agents}, selected={selected_num_agents}), "
             f"num_envs={env.num_envs}, num_agents_actual={env.num_agents}"
         )
+        print(f"action_source={action_source.mode_label()}")
+        print(f"box_source={resolved_box_source}")
         print(
             f"control_mode={cfg.control_mode}, init_mode={cfg.init_mode}, max_controlled_agents={cfg.max_controlled_agents}, "
             f"ego_idx={ego_idx}, ego_id={ego_id}"
         )
+        if cfg.action_source == "policy" and cfg.control_mode != "control_sdc_only":
+            print(
+                "[note] control_mode is not control_sdc_only, so multiple agents may be policy-controlled. "
+                "Use --control-mode control_sdc_only for human-trajectory replay of non-SDC actors."
+            )
+        if cfg.control_mode == "control_sdc_only" and resolved_box_source == "sim":
+            print(
+                "[note] sim box source only includes active agents; with control_sdc_only this is typically one actor. "
+                "Use --box-source map_replay to visualize other WOMD actors."
+            )
         print(
             f"Cameras: {cfg.cameras} | write_video={cfg.write_video} codec={cfg.video_codec} fps={cfg.video_fps} | "
             f"save_frames={cfg.save_frames}"
@@ -539,12 +970,28 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             if not map_features:
                 raise RuntimeError(f"No map features available at frame={frame_idx}")
 
-            scenario = build_scenario(
-                state=state,
-                ego_idx=ego_idx,
-                include_ego_box=cfg.include_ego_box,
-                map_features=map_features,
-            )
+            if replay_data is not None:
+                gt_boxes_world, gt_names = build_boxes_from_map_replay(
+                    replay_data=replay_data,
+                    frame_idx=frame_idx,
+                    ego_x=ego_x,
+                    ego_y=ego_y,
+                    ego_z=float(state["z"][ego_idx]),
+                    include_ego_box=cfg.include_ego_box,
+                )
+                scenario = build_scenario_from_boxes(
+                    ego_heading=float(state["heading"][ego_idx]),
+                    map_features=map_features,
+                    gt_boxes_world=gt_boxes_world,
+                    gt_names=gt_names,
+                )
+            else:
+                scenario = build_scenario(
+                    state=state,
+                    ego_idx=ego_idx,
+                    include_ego_box=cfg.include_ego_box,
+                    map_features=map_features,
+                )
             rendered = renderer.observe(scenario)
             if cfg.save_frames:
                 save_frame_images(cfg.out_dir, frame_idx, rendered)
@@ -553,8 +1000,10 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             log_nonzero_pixels(frame_idx, rendered)
 
             if frame_idx < (cfg.frames - 1):
-                validate_action_contract(env, neutral_actions)
-                env.step(neutral_actions)
+                actions = action_source.next_actions(obs)
+                validate_action_contract(env, actions)
+                obs, _, terminals, truncations, _ = env.step(actions)
+                action_source.on_step_result(terminals, truncations)
 
         return {
             "scene_name": scene_name,
