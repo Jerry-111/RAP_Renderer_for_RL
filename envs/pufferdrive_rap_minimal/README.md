@@ -2,7 +2,7 @@
 
 This folder creates one reproducible Python environment for:
 
-- `minimal_rap_bridge/render_pufferdrive_to_rap.py`
+- `minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py`
 - RAP `ScenarioRenderer` smoke rendering
 
 It is intentionally minimal and avoids deep RAP/nuPlan setup.
@@ -29,6 +29,8 @@ From repo root:
 bash envs/pufferdrive_rap_minimal/setup_env.sh
 ```
 
+The script is idempotent and can be run from any working directory.
+
 This now performs an enforced validation at the end:
 
 - imports
@@ -47,6 +49,13 @@ Optional custom map dir for enforced Drive check:
 
 ```bash
 bash envs/pufferdrive_rap_minimal/setup_env.sh /tmp/.venv-pufferdrive-rap resources/drive/binaries
+```
+
+If your node needs a custom pip index/mirror:
+
+```bash
+PIP_EXTRA_ARGS="-i https://<index>/simple --trusted-host <index-host>" \
+bash envs/pufferdrive_rap_minimal/setup_env.sh
 ```
 
 Activate:
@@ -76,7 +85,7 @@ python envs/pufferdrive_rap_minimal/validate_env.py --check-drive --map-dir reso
 ## Run Minimal Bridge
 
 ```bash
-python minimal_rap_bridge/render_pufferdrive_to_rap.py \
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
   --out-dir /tmp/pufferdrive_rap_minimal \
   --frames 30 \
   --map-dir resources/drive/binaries \
@@ -92,4 +101,4 @@ python minimal_rap_bridge/render_pufferdrive_to_rap.py \
 - Native extensions are built in-place with:
   - `python setup.py build_ext --inplace --force`
 - Headless visualizer tools (`xvfb`, `xauth`, `ffmpeg`) are still system-level (apt) concerns; see:
-  - `minimal_rap_bridge/docs/cluster-headless-setup.md`
+  - `envs/pufferdrive_rap_minimal/cluster-headless-setup.md`
