@@ -4,6 +4,9 @@ Quick runbook for rendering selected WOMD scenes with:
 - the Python bridge (`render_pufferdrive_to_rap_mvp.py`)
 - the native PufferDrive renderer (`./visualize`)
 
+Use `--renderer-backend jax` to run the JAX-optimized RAP renderer copy (`process_data/helpers/renderer_jax.py`).
+For environment setup, use `envs/pufferdrive_rap_minimal/setup_env.sh` (it installs JAX by default via `INSTALL_JAX=1`).
+
 ## 1) Bridge render with PyTorch policy (videos only, no JPG frames)
 
 Run from repo root (`/root/RAP_Renderer_for_RL`):
@@ -14,6 +17,7 @@ python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
   --map-dir /jerry_slow_vol/womd_bins/validation \
   --replay-all-scenes \
   --scene-ids 18,35,63 \
+  --renderer-backend jax \
   --num-maps 1 \
   --action-source policy \
   --goal-behavior 1 \
@@ -150,3 +154,41 @@ Optional sanity checks:
 grep "^Scenes to replay:" "$LOG_FILE"
 grep "selected_agents=" "$LOG_FILE" | sort | uniq -c
 ```
+
+## 6) Quick backend profile (5 scenes, no frame/video output)
+
+This mode disables frame JPGs, MP4 writing, and per-frame pixel logs via `--profile-no-io`.
+
+Run from repo root (`/root/RAP_Renderer_for_RL`):
+
+```bash
+source .venv/bin/activate
+
+COMMON_ARGS=(
+  --map-dir /jerry_slow_vol/womd_bins/validation
+  --replay-all-scenes
+  --max-scenes 5
+  --num-maps 1
+  --full-episode
+  --episode-length 91
+  --action-source neutral
+  --control-mode control_sdc_only
+  --init-mode create_all_valid
+  --box-source map_replay
+  --profile-no-io
+  --out-dir /tmp/pd_profile_no_io
+)
+
+# NumPy renderer baseline
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
+  --renderer-backend numpy \
+  "${COMMON_ARGS[@]}"
+
+# JAX renderer (GPU-enforced in current bridge code)
+export JAX_PLATFORMS=cuda
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
+  --renderer-backend jax \
+  "${COMMON_ARGS[@]}"
+```
+
+Note: `--renderer-backend jax` currently fails fast if CUDA cannot be initialized or no visible GPU is detected.

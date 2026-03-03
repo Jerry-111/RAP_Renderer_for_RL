@@ -29,7 +29,7 @@ if str(RAP_ROOT) not in sys.path:
     sys.path.insert(0, str(RAP_ROOT))
 
 from pufferlib.ocean.drive.drive import Drive  # noqa: E402
-from process_data.helpers.renderer import ScenarioRenderer, camera_params  # noqa: E402
+from process_data.helpers.renderer import camera_params  # noqa: E402
 
 
 @dataclass
@@ -70,6 +70,50 @@ class BridgeConfig:
     scene_ids: List[int] | None
     max_scenes: int | None
     full_episode: bool
+    renderer_backend: str
+    profile_no_io: bool
+
+
+def resolve_renderer_class(backend: str):
+    if backend == "numpy":
+        module_name = "process_data.helpers.renderer"
+    elif backend == "jax":
+        module_name = "process_data.helpers.renderer_jax"
+    else:
+        raise ValueError(f"Unsupported renderer backend: {backend}")
+
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as e:
+        if backend == "jax":
+            raise ModuleNotFoundError(
+                "JAX renderer backend requested but dependencies are missing. "
+                "Install `jax`/`jaxlib` in this environment and retry with --renderer-backend jax."
+            ) from e
+        raise
+
+    if backend == "jax":
+        try:
+            import jax  # local import so numpy backend has no jax dependency
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "JAX renderer backend requested but `jax` is not importable."
+            ) from e
+        try:
+            devices = jax.devices()
+        except Exception as e:
+            raise RuntimeError(
+                "JAX renderer backend requires GPU and GPU enforcement is enabled, "
+                "but JAX failed to initialize CUDA."
+            ) from e
+        gpu_devices = [d for d in devices if d.platform == "gpu"]
+        if not gpu_devices:
+            raise RuntimeError(
+                "JAX renderer backend requires GPU and GPU enforcement is enabled. "
+                f"Detected JAX devices: {devices}. "
+                "Use --renderer-backend numpy or fix JAX CUDA runtime visibility."
+            )
+    return module.ScenarioRenderer
 
 
 def parse_scene_ids(scene_ids: str | None) -> List[int] | None:
@@ -106,6 +150,13 @@ def parse_args() -> BridgeConfig:
         type=str,
         default="CAM_F0,CAM_L0,CAM_R0",
         help="Comma-separated camera ids from RAP camera_params",
+    )
+    parser.add_argument(
+        "--renderer-backend",
+        type=str,
+        default="numpy",
+        choices=["numpy", "jax"],
+        help="Renderer implementation backend: original NumPy renderer or JAX-optimized copy",
     )
     parser.add_argument("--ego-agent-index", type=int, default=0)
     parser.add_argument("--include-ego-box", action="store_true")
@@ -199,6 +250,12 @@ def parse_args() -> BridgeConfig:
         default=True,
         help="Print per-frame nonzero-pixel camera counts",
     )
+    parser.add_argument(
+        "--profile-no-io",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable frame/video/log outputs for renderer profiling",
+    )
     parser.add_argument("--video-fps", type=float, default=10.0)
     parser.add_argument("--video-codec", type=str, default="mp4v", help="4-char codec (e.g., mp4v, avc1)")
     parser.add_argument("--replay-all-scenes", action="store_true", help="Replay all map_*.bin scenes from --map-dir")
@@ -244,6 +301,14 @@ def parse_args() -> BridgeConfig:
         if not args.policy_model_path.exists():
             raise FileNotFoundError(f"Policy checkpoint not found: {args.policy_model_path}")
 
+    write_video = args.write_video
+    save_frames = args.save_frames
+    log_frame_pixels = args.log_frame_pixels
+    if args.profile_no_io:
+        write_video = False
+        save_frames = False
+        log_frame_pixels = False
+
     return BridgeConfig(
         out_dir=args.out_dir,
         frames=frames,
@@ -272,15 +337,17 @@ def parse_args() -> BridgeConfig:
         policy_deterministic=args.policy_deterministic,
         box_source=args.box_source,
         single_env_mode=args.single_env_mode,
-        write_video=args.write_video,
-        save_frames=args.save_frames,
-        log_frame_pixels=args.log_frame_pixels,
+        write_video=write_video,
+        save_frames=save_frames,
+        log_frame_pixels=log_frame_pixels,
         video_fps=args.video_fps,
         video_codec=args.video_codec,
         replay_all_scenes=args.replay_all_scenes,
         scene_ids=scene_ids,
         max_scenes=args.max_scenes,
         full_episode=args.full_episode,
+        renderer_backend=args.renderer_backend,
+        profile_no_io=args.profile_no_io,
     )
 
 
@@ -904,7 +971,8 @@ def stage_single_scene_map(scene_source: Path) -> Path:
 
 
 def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> Dict[str, int | float | str]:
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.write_video or cfg.save_frames:
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     env, selected_num_agents = create_single_scene_env(cfg)
     video_writers: Dict[str, cv2.VideoWriter] = {}
@@ -915,7 +983,8 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             raise RuntimeError("No boundary polylines found from env.get_road_edge_polylines()")
 
         render_width, render_height = 1920, 1120
-        renderer = ScenarioRenderer(camera_channel_list=cfg.cameras, width=render_width, height=render_height)
+        renderer_cls = resolve_renderer_class(cfg.renderer_backend)
+        renderer = renderer_cls(camera_channel_list=cfg.cameras, width=render_width, height=render_height)
         action_source = create_action_source(cfg, env)
         obs = np.array(env.observations, copy=True)
         resolved_box_source = cfg.box_source
@@ -967,6 +1036,8 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             f"Cameras: {cfg.cameras} | write_video={cfg.write_video} codec={cfg.video_codec} fps={cfg.video_fps} | "
             f"save_frames={cfg.save_frames}"
         )
+        print(f"renderer_backend={cfg.renderer_backend}")
+        print(f"profile_no_io={cfg.profile_no_io}")
 
         scene_start = time.perf_counter()
         render_total_ms = 0.0
@@ -1059,7 +1130,8 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
 
 def run_bridge(cfg: BridgeConfig) -> None:
     scenes = resolve_scenes(cfg)
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.write_video or cfg.save_frames:
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Scenes to replay: {len(scenes)}")
 
     summaries: List[Dict[str, int | float | str]] = []

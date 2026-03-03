@@ -7,6 +7,9 @@ MAP_DIR_INPUT="${2:-resources/drive/binaries}"
 
 # Keep setup linear and manual-friendly.
 INSTALL_TORCH="${INSTALL_TORCH:-1}"
+INSTALL_JAX="${INSTALL_JAX:-1}"
+JAX_WHEEL="${JAX_WHEEL:-jax[cuda12]}"
+ENFORCE_JAX_GPU="${ENFORCE_JAX_GPU:-1}"
 BUILD_EXT="${BUILD_EXT:-1}"
 RUN_VALIDATE="${RUN_VALIDATE:-1}"
 
@@ -51,6 +54,9 @@ echo "[setup] python: ${PYTHON_BIN}"
 echo "[setup] venv path: ${VENV_PATH}"
 echo "[setup] map dir: ${MAP_DIR}"
 echo "[setup] install torch: ${INSTALL_TORCH}"
+echo "[setup] install jax: ${INSTALL_JAX}"
+echo "[setup] jax wheel: ${JAX_WHEEL}"
+echo "[setup] enforce jax gpu: ${ENFORCE_JAX_GPU}"
 echo "[setup] build native extensions: ${BUILD_EXT}"
 echo "[setup] run validation: ${RUN_VALIDATE}"
 
@@ -81,6 +87,29 @@ run_pip install \
 if [[ "${INSTALL_TORCH}" == "1" ]]; then
   echo "[setup] installing torch..."
   run_pip install torch
+fi
+
+if [[ "${INSTALL_JAX}" == "1" ]]; then
+  echo "[setup] installing jax package: ${JAX_WHEEL}"
+  run_pip install --upgrade "${JAX_WHEEL}"
+  python - <<'PY'
+import os
+import jax
+import jaxlib
+
+backend = jax.default_backend()
+devices = jax.devices()
+gpu_devices = [d for d in devices if d.platform == "gpu"]
+print(f"[setup] jax version: {jax.__version__}, jaxlib version: {jaxlib.__version__}")
+print(f"[setup] jax backend: {backend}")
+print(f"[setup] jax devices: {devices}")
+
+if os.environ.get("ENFORCE_JAX_GPU", "1") == "1" and not gpu_devices:
+    raise SystemExit(
+        "[setup][error] JAX GPU enforcement is enabled but no GPU devices were detected. "
+        "Ensure NVIDIA driver/CUDA runtime is available and JAX CUDA wheels are installed."
+    )
+PY
 fi
 
 echo "[setup] installing local package (editable, NO_TRAIN=1)..."
