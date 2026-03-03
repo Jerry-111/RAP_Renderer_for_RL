@@ -76,3 +76,77 @@ Optional: restore default respawn mode afterwards:
 ```bash
 sed -i 's/^goal_behavior = .*/goal_behavior = 0/' pufferlib/config/ocean/drive.ini
 ```
+
+## 4) Profile 10 scenes (forward/step/RAP render/scene total)
+
+Run from repo root (`/root/RAP_Renderer_for_RL`):
+
+```bash
+source .venv/bin/activate
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
+  --map-dir /jerry_slow_vol/womd_bins/validation \
+  --replay-all-scenes \
+  --max-scenes 10 \
+  --num-maps 1 \
+  --action-source policy \
+  --control-mode control_sdc_only \
+  --init-mode create_all_valid \
+  --no-write-video \
+  --no-save-frames \
+  --no-log-frame-pixels \
+  --out-dir /tmp/pufferdrive_rap_profile_10
+```
+
+At the end it prints:
+- `avg_inference_forward_ms`
+- `avg_step_ms`
+- `avg_rap_renderer_ms`
+- `avg_scene_total_ms`
+
+## 5) Profile all 75 validation scenes (comprehensive, no video output)
+
+Use this when you want a broader benchmark across all scenes while measuring only:
+- policy inference forward
+- env step
+- RAP renderer
+- total scene time
+
+Run from repo root (`/root/RAP_Renderer_for_RL`):
+
+```bash
+source .venv/bin/activate
+
+OUT_DIR="/tmp/pd_profile_75scenes_goal1_sdc_policy_mapreplay"
+LOG_FILE="/tmp/pd_profile_75scenes_goal1_sdc_policy_mapreplay.log"
+
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
+  --map-dir /jerry_slow_vol/womd_bins/validation \
+  --replay-all-scenes \
+  --max-scenes 75 \
+  --num-maps 1 \
+  --frames 91 \
+  --episode-length 91 \
+  --action-source policy \
+  --policy-device cuda:0 \
+  --goal-behavior 1 \
+  --control-mode control_sdc_only \
+  --init-mode create_all_valid \
+  --box-source map_replay \
+  --no-write-video \
+  --no-save-frames \
+  --no-log-frame-pixels \
+  --out-dir "$OUT_DIR" | tee "$LOG_FILE"
+```
+
+Read the aggregate timing results:
+
+```bash
+grep -A5 "=== Timing Aggregate (Across Scenes) ===" "$LOG_FILE"
+```
+
+Optional sanity checks:
+
+```bash
+grep "^Scenes to replay:" "$LOG_FILE"
+grep "selected_agents=" "$LOG_FILE" | sort | uniq -c
+```

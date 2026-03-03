@@ -31,13 +31,14 @@ bash envs/pufferdrive_rap_minimal/setup_env.sh
 
 The script is idempotent and can be run from any working directory.
 
-This now performs an enforced validation at the end:
+What it runs (in order):
 
-- imports
-- RAP renderer smoke
-- PufferDrive functional smoke (`Drive` init + `reset` + multiple `step`s + global state + road edges)
-
-Setup fails if any of those checks fail.
+- create/activate venv
+- install core deps (`numpy`, gym stack, RAP extras)
+- install `torch` (default on)
+- install local package in editable mode (`NO_TRAIN=1`)
+- build native extensions (`python setup.py build_ext --inplace --force`)
+- run validation (full Drive check when `map_000.bin` exists)
 
 Optional custom venv path:
 
@@ -55,6 +56,13 @@ If your node needs a custom pip index/mirror:
 
 ```bash
 PIP_EXTRA_ARGS="-i https://<index>/simple --trusted-host <index-host>" \
+bash envs/pufferdrive_rap_minimal/setup_env.sh
+```
+
+Disable optional steps if desired:
+
+```bash
+INSTALL_TORCH=0 BUILD_EXT=0 RUN_VALIDATE=0 \
 bash envs/pufferdrive_rap_minimal/setup_env.sh
 ```
 

@@ -9,6 +9,7 @@ import struct
 import shutil
 import sys
 import tempfile
+import time
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -62,6 +63,7 @@ class BridgeConfig:
     single_env_mode: str
     write_video: bool
     save_frames: bool
+    log_frame_pixels: bool
     video_fps: float
     video_codec: str
     replay_all_scenes: bool
@@ -191,6 +193,12 @@ def parse_args() -> BridgeConfig:
         default=True,
         help="Save per-frame JPGs in addition to videos",
     )
+    parser.add_argument(
+        "--log-frame-pixels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print per-frame nonzero-pixel camera counts",
+    )
     parser.add_argument("--video-fps", type=float, default=10.0)
     parser.add_argument("--video-codec", type=str, default="mp4v", help="4-char codec (e.g., mp4v, avc1)")
     parser.add_argument("--replay-all-scenes", action="store_true", help="Replay all map_*.bin scenes from --map-dir")
@@ -224,8 +232,6 @@ def parse_args() -> BridgeConfig:
         raise ValueError("--video-fps must be > 0")
     if len(args.video_codec) != 4:
         raise ValueError("--video-codec must be exactly 4 characters")
-    if (not args.write_video) and (not args.save_frames):
-        raise ValueError("At least one output must be enabled: --write-video or --save-frames")
     if args.max_scenes is not None and args.max_scenes <= 0:
         raise ValueError("--max-scenes must be > 0 when provided")
     if args.replay_all_scenes and args.num_maps != 1:
@@ -268,6 +274,7 @@ def parse_args() -> BridgeConfig:
         single_env_mode=args.single_env_mode,
         write_video=args.write_video,
         save_frames=args.save_frames,
+        log_frame_pixels=args.log_frame_pixels,
         video_fps=args.video_fps,
         video_codec=args.video_codec,
         replay_all_scenes=args.replay_all_scenes,
@@ -896,7 +903,7 @@ def stage_single_scene_map(scene_source: Path) -> Path:
     return stage_dir
 
 
-def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> Dict[str, int | str]:
+def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> Dict[str, int | float | str]:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     env, selected_num_agents = create_single_scene_env(cfg)
@@ -961,6 +968,14 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             f"save_frames={cfg.save_frames}"
         )
 
+        scene_start = time.perf_counter()
+        render_total_ms = 0.0
+        render_calls = 0
+        inference_total_ms = 0.0
+        inference_calls = 0
+        step_total_ms = 0.0
+        step_calls = 0
+
         for frame_idx in range(cfg.frames):
             state = env.get_global_agent_state()
             ego_idx = resolve_ego_index_by_id(state, ego_id=ego_id, fallback_idx=ego_idx)
@@ -992,24 +1007,50 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
                     include_ego_box=cfg.include_ego_box,
                     map_features=map_features,
                 )
+            t0 = time.perf_counter()
             rendered = renderer.observe(scenario)
+            render_total_ms += (time.perf_counter() - t0) * 1000.0
+            render_calls += 1
             if cfg.save_frames:
                 save_frame_images(cfg.out_dir, frame_idx, rendered)
             if cfg.write_video:
                 write_video_frames(video_writers, rendered)
-            log_nonzero_pixels(frame_idx, rendered)
+            if cfg.log_frame_pixels:
+                log_nonzero_pixels(frame_idx, rendered)
 
             if frame_idx < (cfg.frames - 1):
+                t0 = time.perf_counter()
                 actions = action_source.next_actions(obs)
+                inference_total_ms += (time.perf_counter() - t0) * 1000.0
+                inference_calls += 1
                 validate_action_contract(env, actions)
+                t0 = time.perf_counter()
                 obs, _, terminals, truncations, _ = env.step(actions)
+                step_total_ms += (time.perf_counter() - t0) * 1000.0
+                step_calls += 1
                 action_source.on_step_result(terminals, truncations)
+
+        scene_total_ms = (time.perf_counter() - scene_start) * 1000.0
+        render_avg_ms = render_total_ms / render_calls if render_calls else 0.0
+        inference_avg_ms = inference_total_ms / inference_calls if inference_calls else 0.0
+        step_avg_ms = step_total_ms / step_calls if step_calls else 0.0
+        print(
+            "[timing] "
+            f"scene_total_ms={scene_total_ms:.3f}, "
+            f"inference_forward_avg_ms={inference_avg_ms:.3f}, "
+            f"step_avg_ms={step_avg_ms:.3f}, "
+            f"rap_renderer_avg_ms={render_avg_ms:.3f}"
+        )
 
         return {
             "scene_name": scene_name,
             "selected_agents": int(selected_num_agents),
             "num_envs": int(env.num_envs),
             "frames": int(cfg.frames),
+            "inference_forward_avg_ms": float(inference_avg_ms),
+            "step_avg_ms": float(step_avg_ms),
+            "rap_renderer_avg_ms": float(render_avg_ms),
+            "scene_total_ms": float(scene_total_ms),
         }
     finally:
         close_video_writers(video_writers)
@@ -1021,7 +1062,7 @@ def run_bridge(cfg: BridgeConfig) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Scenes to replay: {len(scenes)}")
 
-    summaries: List[Dict[str, int | str]] = []
+    summaries: List[Dict[str, int | float | str]] = []
     for scene_name, scene_source in scenes:
         scene_out_dir = cfg.out_dir if len(scenes) == 1 else (cfg.out_dir / scene_name)
         stage_dir = stage_single_scene_map(scene_source)
@@ -1037,6 +1078,18 @@ def run_bridge(cfg: BridgeConfig) -> None:
             f"scene={s['scene_name']} frames={s['frames']} selected_agents={s['selected_agents']} "
             f"num_envs={s['num_envs']}"
         )
+
+    inference_avgs = np.array([float(s["inference_forward_avg_ms"]) for s in summaries], dtype=np.float64)
+    step_avgs = np.array([float(s["step_avg_ms"]) for s in summaries], dtype=np.float64)
+    render_avgs = np.array([float(s["rap_renderer_avg_ms"]) for s in summaries], dtype=np.float64)
+    scene_totals = np.array([float(s["scene_total_ms"]) for s in summaries], dtype=np.float64)
+    if summaries:
+        print("\n=== Timing Aggregate (Across Scenes) ===")
+        print(f"scenes={len(summaries)}")
+        print(f"avg_inference_forward_ms={float(inference_avgs.mean()):.3f}")
+        print(f"avg_step_ms={float(step_avgs.mean()):.3f}")
+        print(f"avg_rap_renderer_ms={float(render_avgs.mean()):.3f}")
+        print(f"avg_scene_total_ms={float(scene_totals.mean()):.3f}")
 
 
 def main() -> None:
