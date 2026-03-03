@@ -155,13 +155,12 @@ grep "^Scenes to replay:" "$LOG_FILE"
 grep "selected_agents=" "$LOG_FILE" | sort | uniq -c
 ```
 
-## 6) Quick backend profile (5 scenes, no frame/video output)
+## 6) Quick backend profile (5 scenes, policy + GPU)
 
-This mode disables frame JPGs, MP4 writing, and per-frame pixel logs via `--profile-no-io`.
-
-Run from repo root (`/root/RAP_Renderer_for_RL`):
+Use this variant when you want policy inference on GPU (`--policy-device cuda:0`) while comparing renderer backends.
 
 ```bash
+cd /root/RAP_Renderer_for_RL
 source .venv/bin/activate
 
 COMMON_ARGS=(
@@ -171,24 +170,24 @@ COMMON_ARGS=(
   --num-maps 1
   --full-episode
   --episode-length 91
-  --action-source neutral
+  --action-source policy
+  --policy-device cuda:0
   --control-mode control_sdc_only
   --init-mode create_all_valid
   --box-source map_replay
   --profile-no-io
-  --out-dir /tmp/pd_profile_no_io
 )
 
-# NumPy renderer baseline
+# 1) NumPy renderer (CPU renderer + GPU policy inference)
 python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
   --renderer-backend numpy \
+  --out-dir /tmp/pd_profile_numpy_gpu_policy \
   "${COMMON_ARGS[@]}"
 
-# JAX renderer (GPU-enforced in current bridge code)
+# 2) JAX renderer (GPU-enforced renderer + GPU policy inference)
 export JAX_PLATFORMS=cuda
 python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
   --renderer-backend jax \
+  --out-dir /tmp/pd_profile_jax_gpu_policy \
   "${COMMON_ARGS[@]}"
 ```
-
-Note: `--renderer-backend jax` currently fails fast if CUDA cannot be initialized or no visible GPU is detected.
