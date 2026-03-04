@@ -5,7 +5,15 @@ Quick runbook for rendering selected WOMD scenes with:
 - the native PufferDrive renderer (`./visualize`)
 
 Use `--renderer-backend jax` to run the JAX-optimized RAP renderer copy (`process_data/helpers/renderer_jax.py`).
-For environment setup, use `envs/pufferdrive_rap_minimal/setup_env.sh` (it installs JAX by default via `INSTALL_JAX=1`).
+For environment setup, use `envs/pufferdrive_rap_minimal/setup_env.sh` (it installs JAX by default via `INSTALL_JAX=1`, with a clean reinstall of `jax[cuda12]==0.4.30`).
+
+If your venv already had mixed/old JAX packages, reset it with:
+
+```bash
+source .venv-pufferdrive-rap/bin/activate
+python -m pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
+python -m pip install -U "jax[cuda12]==0.4.30"
+```
 
 ## 1) Bridge render with PyTorch policy (videos only, no JPG frames)
 
@@ -42,7 +50,7 @@ Notes:
 - Default policy checkpoint is `pufferlib/resources/drive/pufferdrive_weights.pt` (WOMD baseline).
 - Default is pufferl-style stochastic sampling. For deterministic rendering, add: `--policy-deterministic`.
 
-## 2) Native renderer for the same 3 scenes (write to /tmp)
+## 2) Native renderer aligned with RAP setup (write to /tmp)
 
 If needed, build once:
 
@@ -51,37 +59,38 @@ source .venv/bin/activate
 bash scripts/build_ocean.sh visualize local
 ```
 
-Then render scenes to `/tmp/pd_native_s18_s35_s63`:
+Then render scenes to `/tmp/pd_native_s18_s35_s63` with RAP-aligned behavior:
+- `goal_behavior = 1`
+- `control_mode = "control_sdc_only"`
+- `init_mode = "create_all_valid"`
+- `max_controlled_agents = 1`
 
 ```bash
-mkdir -p /tmp/pd_native_s18_s35_s63
+CFG="pufferlib/config/ocean/drive.ini"
+OUT="/tmp/pd_native_s18_s35_s63"
+mkdir -p "$OUT"
+BACKUP=$(mktemp)
+cp "$CFG" "$BACKUP"
+trap 'cp "$BACKUP" "$CFG"; rm -f "$BACKUP"' EXIT
+
+sed -i 's/^goal_behavior = .*/goal_behavior = 1/' "$CFG"
+sed -i 's/^control_mode = .*/control_mode = "control_sdc_only"/' "$CFG"
+sed -i 's/^init_mode = .*/init_mode = "create_all_valid"/' "$CFG"
+sed -i 's/^max_controlled_agents = .*/max_controlled_agents = 1/' "$CFG"
+
 for sid in 018 035 063; do
-  xvfb-run -a -s "-screen 0 1280x720x24" \
+  ASAN_OPTIONS=detect_leaks=0 xvfb-run -a -s "-screen 0 1280x720x24" \
     ./visualize \
     --map-name /jerry_slow_vol/womd_bins/validation/map_${sid}.bin \
-    --output-topdown /tmp/pd_native_s18_s35_s63/map_${sid}_topdown.mp4 \
-    --output-agent /tmp/pd_native_s18_s35_s63/map_${sid}_agent.mp4
+    --output-topdown "$OUT/map_${sid}_topdown.mp4" \
+    --output-agent "$OUT/map_${sid}_agent.mp4"
 done
 ```
 
-## 3) Native goal behavior control (set to mode 1)
+`./visualize` does not currently expose these controls as CLI flags, so `drive.ini`
+must be set before native renders.
 
-Native `./visualize` currently does not expose `--goal-behavior` as a CLI flag.
-It reads this from `pufferlib/config/ocean/drive.ini`.
-
-Set `goal_behavior=1` before running native renders:
-
-```bash
-sed -i 's/^goal_behavior = .*/goal_behavior = 1/' pufferlib/config/ocean/drive.ini
-```
-
-Optional: restore default respawn mode afterwards:
-
-```bash
-sed -i 's/^goal_behavior = .*/goal_behavior = 0/' pufferlib/config/ocean/drive.ini
-```
-
-## 4) Profile 10 scenes (forward/step/RAP render/scene total)
+## 3) Profile 10 scenes (forward/step/RAP render/scene total)
 
 Run from repo root (`/root/RAP_Renderer_for_RL`):
 
@@ -107,7 +116,7 @@ At the end it prints:
 - `avg_rap_renderer_ms`
 - `avg_scene_total_ms`
 
-## 5) Profile all 75 validation scenes (comprehensive, no video output)
+## 4) Profile all 75 validation scenes (comprehensive, no video output)
 
 Use this when you want a broader benchmark across all scenes while measuring only:
 - policy inference forward
@@ -155,7 +164,7 @@ grep "^Scenes to replay:" "$LOG_FILE"
 grep "selected_agents=" "$LOG_FILE" | sort | uniq -c
 ```
 
-## 6) Quick backend profile (5 scenes, policy + GPU)
+## 5) Quick backend profile (5 scenes, policy + GPU)
 
 Use this variant when you want policy inference on GPU (`--policy-device cuda:0`) while comparing renderer backends.
 

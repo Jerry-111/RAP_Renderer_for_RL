@@ -8,7 +8,7 @@ MAP_DIR_INPUT="${2:-resources/drive/binaries}"
 # Keep setup linear and manual-friendly.
 INSTALL_TORCH="${INSTALL_TORCH:-1}"
 INSTALL_JAX="${INSTALL_JAX:-1}"
-JAX_WHEEL="${JAX_WHEEL:-jax[cuda12]}"
+JAX_WHEEL="${JAX_WHEEL:-jax[cuda12]==0.4.30}"
 ENFORCE_JAX_GPU="${ENFORCE_JAX_GPU:-1}"
 BUILD_EXT="${BUILD_EXT:-1}"
 RUN_VALIDATE="${RUN_VALIDATE:-1}"
@@ -90,7 +90,9 @@ if [[ "${INSTALL_TORCH}" == "1" ]]; then
 fi
 
 if [[ "${INSTALL_JAX}" == "1" ]]; then
-  echo "[setup] installing jax package: ${JAX_WHEEL}"
+  echo "[setup] removing pre-existing jax packages..."
+  run_pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt || true
+  echo "[setup] installing jax package (pinned): ${JAX_WHEEL}"
   run_pip install --upgrade "${JAX_WHEEL}"
   python - <<'PY'
 import os

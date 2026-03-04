@@ -36,6 +36,7 @@ What it runs (in order):
 - create/activate venv
 - install core deps (`numpy`, gym stack, RAP extras)
 - install `torch` (default on)
+- clean reinstall of JAX with pinned CUDA wheel (`jax[cuda12]==0.4.30`)
 - install local package in editable mode (`NO_TRAIN=1`)
 - build native extensions (`python setup.py build_ext --inplace --force`)
 - run validation (full Drive check when `map_000.bin` exists)
@@ -64,6 +65,14 @@ Disable optional steps if desired:
 ```bash
 INSTALL_TORCH=0 BUILD_EXT=0 RUN_VALIDATE=0 \
 bash envs/pufferdrive_rap_minimal/setup_env.sh
+```
+
+Manual JAX reset (same fix used by setup):
+
+```bash
+source .venv-pufferdrive-rap/bin/activate
+python -m pip uninstall -y jax jaxlib jax-cuda12-plugin jax-cuda12-pjrt
+python -m pip install -U "jax[cuda12]==0.4.30"
 ```
 
 Activate:

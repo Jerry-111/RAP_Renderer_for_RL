@@ -1,6 +1,7 @@
 import cv2
 import jax
 import jax.numpy as jnp
+import math
 import numpy as np
 from numpy import array
 
@@ -9,6 +10,10 @@ from numpy import array
 
 
 def _to_jax(x, dtype=jnp.float32):
+    if isinstance(x, jax.Array):
+        if dtype is None or x.dtype == dtype:
+            return x
+        return x.astype(dtype)
     return jnp.asarray(x, dtype=dtype)
 
 
@@ -72,6 +77,64 @@ def _project_homogeneous_jit(points_cam: jnp.ndarray, K: jnp.ndarray) -> jnp.nda
     return uv_h[:, :2] / uv_h[:, 2:3]
 
 
+_CUBOID_CORNER_SIGNS = jnp.array(
+    [
+        [1.0, 1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [-1.0, -1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+        [1.0, 1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [-1.0, -1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+    ],
+    dtype=jnp.float32,
+)
+
+
+@jax.jit
+def _batch_cuboid_cam_project_jit(
+    bboxes: jnp.ndarray,
+    T_w2c: jnp.ndarray,
+    K: jnp.ndarray,
+    H: jnp.ndarray,
+    W: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    # Vectorized cuboid world->camera and projection for all vehicles in one call.
+    pos = bboxes[:, :3]
+    half_dims = bboxes[:, 3:6] * 0.5
+    yaw = bboxes[:, 6]
+
+    corners_local = _CUBOID_CORNER_SIGNS[None, :, :] * half_dims[:, None, :]
+
+    c = jnp.cos(yaw)
+    s = jnp.sin(yaw)
+    zeros = jnp.zeros_like(c)
+    ones = jnp.ones_like(c)
+    R_yaw = jnp.stack(
+        [
+            jnp.stack([c, -s, zeros], axis=1),
+            jnp.stack([s, c, zeros], axis=1),
+            jnp.stack([zeros, zeros, ones], axis=1),
+        ],
+        axis=1,
+    )
+
+    corners_world = jnp.einsum("nij,nkj->nki", R_yaw, corners_local) + pos[:, None, :]
+
+    R = T_w2c[:3, :3]
+    t = T_w2c[:3, 3]
+    pts_cam = jnp.einsum("ij,nkj->nki", R, corners_world) + t
+
+    z = pts_cam[:, :, 2]
+    z_safe = jnp.where(jnp.abs(z) > 1e-6, z, 1e-6)
+    u = K[0, 0] * pts_cam[:, :, 0] / z_safe + K[0, 2]
+    v = K[1, 1] * pts_cam[:, :, 1] / z_safe + K[1, 2]
+    uv = jnp.stack([u, v], axis=2)
+    valid = (z > 1e-3) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    return pts_cam, uv, valid
+
+
 def build_se3(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     """4×4 SE(3) 齐次矩阵"""
     return np.asarray(_build_se3_jit(_to_jax(R), _to_jax(t)), dtype=np.float32)
@@ -92,23 +155,33 @@ COLOR_TABLE = {
 }
 
 def yaw_to_rot(yaw: float) -> np.ndarray:
-    return np.asarray(_yaw_to_rot_jit(_to_jax(yaw)), dtype=np.float32)
+    # Tiny scalar ops are faster with NumPy/stdlib than JAX dispatch in tight loops.
+    c, s = math.cos(yaw), math.sin(yaw)
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
 
 def world_to_camera_T(lidar_pos, lidar_yaw,
-                      cam2lidar_t, cam2lidar_R) -> np.ndarray:
+                      cam2lidar_t, cam2lidar_R,
+                      return_jax: bool = False):
     """
     构造世界到相机的齐次变换
     world ─► lidar ─► camera
     """
-    return np.asarray(
-        _world_to_camera_T_jit(
-            _to_jax(lidar_pos),
-            _to_jax(lidar_yaw),
-            _to_jax(cam2lidar_t),
-            _to_jax(cam2lidar_R),
-        ),
-        dtype=np.float32,
+    T = _world_to_camera_T_jit(
+        _to_jax(lidar_pos),
+        _to_jax(lidar_yaw),
+        _to_jax(cam2lidar_t),
+        _to_jax(cam2lidar_R),
     )
+    if return_jax:
+        return T
+    return np.asarray(T, dtype=np.float32)
 
 
 def project_points_cam(points_cam: np.ndarray,
@@ -455,30 +528,26 @@ def draw_cuboids_with_occlusion(canvas, bboxes, T_w2c, K, depth_max=120.0):
     # ---- 3) 收集所有要绘制的“面” ----
     faces_to_draw = []  # 列表中每项：{'poly': np.int32((4,2)), 'depth': float, 'base_color': (B,G,R)}
 
+    bboxes = np.asarray(bboxes, dtype=np.float32)
+    if bboxes.size == 0:
+        return
+
+    pts_cam_all, uv_all, valid_all = _batch_cuboid_cam_project_jit(
+        _to_jax(bboxes[:, :7]),
+        _to_jax(T_w2c),
+        _to_jax(K),
+        _to_jax(H),
+        _to_jax(W),
+    )
+    pts_cam_all = np.asarray(pts_cam_all, dtype=np.float32)
+    uv_all = np.asarray(uv_all, dtype=np.int32)
+    valid_all = np.asarray(valid_all, dtype=bool)
+
     num_vehicles = bboxes.shape[0]
     for vi in range(num_vehicles):
-        info = bboxes[vi]
-        pos   = info[:3]      # (x, y, z)
-        L     = info[3]       # 长
-        Wd    = info[4]       # 宽
-        H_box = info[5]       # 高
-        yaw   = info[6]       # 偏航角
-
-        # 3.1) 局部角点，(8,3)
-        corners_loc = vehicle_corners_local(L, Wd, H_box)
-
-        # 3.2) 世界坐标系下旋转 + 平移
-        R_yaw = yaw_to_rot(yaw)                           
-        corners_world = (R_yaw @ corners_loc.T).T + pos   
-
-        # 3.3) 转到相机坐标系
-        pts_cam = np.asarray(
-            _transform_points_w2c_jit(_to_jax(corners_world), _to_jax(T_w2c)),
-            dtype=np.float32,
-        )
-
-        # 3.4) 投影到像素平面，得到 uv 以及 valid mask
-        uv, valid = project_points_cam(pts_cam, K, (H, W))  # uv: (8,2)，valid: (8,)
+        pts_cam = pts_cam_all[vi]
+        uv = uv_all[vi]
+        valid = valid_all[vi]
 
         # 如果 8 个顶点里可见的少于 4 个，就跳过这辆车
         if valid.sum() < 4:
@@ -774,23 +843,36 @@ class ScenarioRenderer:
         self.width = width
         self.height = height
         self.depth_max = depth_max
+        self.lidar_pos = np.zeros(3, dtype=np.float32)
+        self.lidar_pos_jax = _to_jax(self.lidar_pos)
         self.camera_models = {}
         for k, v in camera_params.items():
             if not k in camera_channel_list: continue
-            self.camera_models[k] = v
+            cam_t = v["sensor2lidar_translation"].astype(np.float32).copy()
+            cam_t[2] += 0.8
+            cam_t[0] -= 2
+            cam_R = v["sensor2lidar_rotation"].astype(np.float32)
+            K = v["intrinsics"].astype(np.float32)
+            self.camera_models[k] = {
+                "cam_t_jax": _to_jax(cam_t),
+                "cam_R_jax": _to_jax(cam_R),
+                "K_jax": _to_jax(K),
+            }
 
     def observe(self, scenario):
-        lidar_pos = np.zeros(3)
+        lidar_pos = self.lidar_pos
         lidar_yaw = scenario['ego_heading']
         ret_dict = {}
         for cam_id, cam_model in self.camera_models.items():
             canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            cam_t = cam_model["sensor2lidar_translation"].copy()  # (3,)
-            cam_t[2] += 0.8
-            cam_t[0] -= 2
-            cam_R = cam_model["sensor2lidar_rotation"]  # (3,3)
-            K = cam_model["intrinsics"]  # (3,3)
-            T_w2c = world_to_camera_T(lidar_pos, lidar_yaw, cam_t, cam_R)  # 4×4
+            K = cam_model["K_jax"]  # Keep intrinsics on device across frames.
+            T_w2c = world_to_camera_T(
+                self.lidar_pos_jax,
+                lidar_yaw,
+                cam_model["cam_t_jax"],
+                cam_model["cam_R_jax"],
+                return_jax=True,
+            )
 
             for feat in scenario['traffic_lights']:
                 is_red = feat[1]
