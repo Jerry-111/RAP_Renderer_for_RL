@@ -22,8 +22,9 @@ def validate_imports() -> None:
     import cv2  # noqa: F401
     from pufferlib.ocean.drive.drive import Drive  # noqa: F401
     from process_data.helpers.renderer import ScenarioRenderer  # noqa: F401
+    from process_data.helpers.renderer_nvdiffrast import ScenarioRenderer as NvdiffrastScenarioRenderer  # noqa: F401
 
-    print("[ok] imports: cv2, Drive, ScenarioRenderer")
+    print("[ok] imports: cv2, Drive, ScenarioRenderer, renderer_nvdiffrast baseline")
 
 
 def validate_renderer_smoke(out_path: Path) -> None:
@@ -115,9 +116,30 @@ def validate_drive_smoke(map_dir: str) -> None:
         env.close()
 
 
+def validate_nvdiffrast_smoke() -> None:
+    import torch
+    import nvdiffrast.torch as dr
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "nvdiffrast validation requested but torch.cuda.is_available() is false."
+        )
+
+    ctx = dr.RasterizeCudaContext()
+    print(
+        "[ok] nvdiffrast smoke: "
+        f"device={torch.cuda.get_device_name(0)}, context={type(ctx).__name__}"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate minimal PufferDrive+RAP env")
     parser.add_argument("--check-drive", action="store_true", help="Also instantiate Drive and read state")
+    parser.add_argument(
+        "--check-nvdiffrast",
+        action="store_true",
+        help="Also verify torch CUDA + nvdiffrast import/context creation",
+    )
     parser.add_argument("--map-dir", default="resources/drive/binaries")
     parser.add_argument("--out-path", type=Path, default=Path("/tmp/pufferdrive_rap_env_validate.jpg"))
     return parser.parse_args()
@@ -129,6 +151,8 @@ def main() -> None:
     validate_renderer_smoke(args.out_path)
     if args.check_drive:
         validate_drive_smoke(args.map_dir)
+    if args.check_nvdiffrast:
+        validate_nvdiffrast_smoke()
     print("[done] environment validation complete")
 
 

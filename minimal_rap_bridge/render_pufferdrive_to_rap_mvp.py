@@ -79,6 +79,8 @@ def resolve_renderer_class(backend: str):
         module_name = "process_data.helpers.renderer"
     elif backend == "jax":
         module_name = "process_data.helpers.renderer_jax"
+    elif backend == "nvdiffrast":
+        module_name = "process_data.helpers.renderer_nvdiffrast"
     else:
         raise ValueError(f"Unsupported renderer backend: {backend}")
 
@@ -89,6 +91,11 @@ def resolve_renderer_class(backend: str):
             raise ModuleNotFoundError(
                 "JAX renderer backend requested but dependencies are missing. "
                 "Install `jax`/`jaxlib` in this environment and retry with --renderer-backend jax."
+            ) from e
+        if backend == "nvdiffrast":
+            raise ModuleNotFoundError(
+                "nvdiffrast renderer backend requested but dependencies are missing. "
+                "Install `torch` and `nvdiffrast` in this environment and retry with --renderer-backend nvdiffrast."
             ) from e
         raise
 
@@ -113,7 +120,42 @@ def resolve_renderer_class(backend: str):
                 f"Detected JAX devices: {devices}. "
                 "Use --renderer-backend numpy or fix JAX CUDA runtime visibility."
             )
+    elif backend == "nvdiffrast":
+        try:
+            import torch  # local import so non-GPU backends avoid torch dependency
+            import nvdiffrast.torch as dr
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "nvdiffrast renderer backend requested but `torch` and/or `nvdiffrast` is not importable."
+            ) from e
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "nvdiffrast renderer backend requires CUDA-visible PyTorch. "
+                "Use --renderer-backend numpy/jax or fix torch CUDA runtime visibility."
+            )
+        try:
+            dr.RasterizeCudaContext(device="cuda")
+        except Exception as e:
+            raise RuntimeError(
+                "nvdiffrast renderer backend requested but failed to create a CUDA raster context."
+            ) from e
     return module.ScenarioRenderer
+
+
+def instantiate_renderer(backend: str,
+                         renderer_cls,
+                         camera_channel_list: List[str],
+                         width: int,
+                         height: int):
+    renderer_kwargs = {
+        "camera_channel_list": camera_channel_list,
+        "width": width,
+        "height": height,
+    }
+    if backend == "nvdiffrast":
+        renderer_kwargs["use_gpu_full_scene"] = True
+        renderer_kwargs["enable_nvdiffrast_antialias"] = False
+    return renderer_cls(**renderer_kwargs)
 
 
 def parse_scene_ids(scene_ids: str | None) -> List[int] | None:
@@ -155,8 +197,8 @@ def parse_args() -> BridgeConfig:
         "--renderer-backend",
         type=str,
         default="numpy",
-        choices=["numpy", "jax"],
-        help="Renderer implementation backend: original NumPy renderer or JAX-optimized copy",
+        choices=["numpy", "jax", "nvdiffrast"],
+        help="Renderer implementation backend: original NumPy renderer, JAX copy, or nvdiffrast full-scene GPU MVP",
     )
     parser.add_argument("--ego-agent-index", type=int, default=0)
     parser.add_argument("--include-ego-box", action="store_true")
@@ -984,7 +1026,13 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
 
         render_width, render_height = 1920, 1120
         renderer_cls = resolve_renderer_class(cfg.renderer_backend)
-        renderer = renderer_cls(camera_channel_list=cfg.cameras, width=render_width, height=render_height)
+        renderer = instantiate_renderer(
+            cfg.renderer_backend,
+            renderer_cls,
+            camera_channel_list=cfg.cameras,
+            width=render_width,
+            height=render_height,
+        )
         action_source = create_action_source(cfg, env)
         obs = np.array(env.observations, copy=True)
         resolved_box_source = cfg.box_source

@@ -4,6 +4,7 @@ This folder creates one reproducible Python environment for:
 
 - `minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py`
 - RAP `ScenarioRenderer` smoke rendering
+- optional Torch + `nvdiffrast` GPU raster backend preparation
 
 It is intentionally minimal and avoids deep RAP/nuPlan setup.
 
@@ -36,6 +37,7 @@ What it runs (in order):
 - create/activate venv
 - install core deps (`numpy`, gym stack, RAP extras)
 - install `torch` (default on)
+- optionally install `nvdiffrast` from source (`INSTALL_NVDIFFRAST=1`)
 - clean reinstall of JAX with pinned CUDA wheel (`jax[cuda12]==0.4.30`)
 - install local package in editable mode (`NO_TRAIN=1`)
 - build native extensions (`python setup.py build_ext --inplace --force`)
@@ -64,6 +66,21 @@ Disable optional steps if desired:
 
 ```bash
 INSTALL_TORCH=0 BUILD_EXT=0 RUN_VALIDATE=0 \
+bash envs/pufferdrive_rap_minimal/setup_env.sh
+```
+
+Enable the planned Torch + `nvdiffrast` renderer environment:
+
+```bash
+INSTALL_NVDIFFRAST=1 CHECK_NVDIFFRAST=1 \
+bash envs/pufferdrive_rap_minimal/setup_env.sh
+```
+
+If you need to pin a specific GPU arch for extension compilation:
+
+```bash
+INSTALL_NVDIFFRAST=1 CHECK_NVDIFFRAST=1 \
+NVDIFFRAST_CUDA_ARCH_LIST=8.6 \
 bash envs/pufferdrive_rap_minimal/setup_env.sh
 ```
 
@@ -97,6 +114,12 @@ Include Drive runtime smoke:
 python envs/pufferdrive_rap_minimal/validate_env.py --check-drive --map-dir resources/drive/binaries
 ```
 
+Include Torch + `nvdiffrast` GPU validation:
+
+```bash
+python envs/pufferdrive_rap_minimal/validate_env.py --check-nvdiffrast
+```
+
 ---
 
 ## Run Minimal Bridge
@@ -106,7 +129,32 @@ python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
   --out-dir /tmp/pufferdrive_rap_minimal \
   --frames 30 \
   --map-dir resources/drive/binaries \
-  --num-maps 1 \
+  --num-maps 1
+```
+
+Renderer backend options:
+
+```bash
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py ... --renderer-backend numpy
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py ... --renderer-backend jax
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py ... --renderer-backend nvdiffrast
+```
+
+Use the `nvdiffrast` backend only after installing it with:
+
+```bash
+INSTALL_NVDIFFRAST=1 bash envs/pufferdrive_rap_minimal/setup_env.sh
+python envs/pufferdrive_rap_minimal/validate_env.py --check-nvdiffrast
+```
+
+Minimal full-scene GPU MVP example:
+
+```bash
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
+  --renderer-backend nvdiffrast \
+  --out-dir /tmp/pufferdrive_rap_minimal_nvdiffrast \
+  --frames 30 \
+  --map-dir resources/drive/binaries \
   --num-agents 32
 ```
 
@@ -117,5 +165,9 @@ python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
 - `setup_env.sh` installs PufferDrive with `NO_TRAIN=1` to reduce dependency load on cluster nodes.
 - Native extensions are built in-place with:
   - `python setup.py build_ext --inplace --force`
+- `nvdiffrast` is not listed in `requirements.txt`; it is installed separately in
+  `setup_env.sh` because the recommended source install uses `--no-build-isolation`.
+- The default `nvdiffrast` source in `setup_env.sh` is pinned to a known-good
+  commit and can be overridden with `NVDIFFRAST_SRC=...` if needed.
 - Headless visualizer tools (`xvfb`, `xauth`, `ffmpeg`) are still system-level (apt) concerns; see:
   - `envs/pufferdrive_rap_minimal/cluster-headless-setup.md`

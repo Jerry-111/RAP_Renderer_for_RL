@@ -4,8 +4,14 @@ Quick runbook for rendering selected WOMD scenes with:
 - the Python bridge (`render_pufferdrive_to_rap_mvp.py`)
 - the native PufferDrive renderer (`./visualize`)
 
-Use `--renderer-backend jax` to run the JAX-optimized RAP renderer copy (`process_data/helpers/renderer_jax.py`).
-For environment setup, use `envs/pufferdrive_rap_minimal/setup_env.sh` (it installs JAX by default via `INSTALL_JAX=1`, with a clean reinstall of `jax[cuda12]==0.4.30`).
+Use:
+- `--renderer-backend numpy` for the original RAP renderer (`process_data/helpers/renderer.py`)
+- `--renderer-backend jax` for the JAX-optimized copy (`process_data/helpers/renderer_jax.py`)
+- `--renderer-backend nvdiffrast` for the Torch + nvdiffrast full-scene GPU MVP (`process_data/helpers/renderer_nvdiffrast.py`)
+
+For environment setup, use `envs/pufferdrive_rap_minimal/setup_env.sh`.
+- JAX is installed by default via `INSTALL_JAX=1`, with a clean reinstall of `jax[cuda12]==0.4.30`.
+- `nvdiffrast` is optional via `INSTALL_NVDIFFRAST=1`.
 
 If your venv already had mixed/old JAX packages, reset it with:
 
@@ -198,5 +204,11 @@ export JAX_PLATFORMS=cuda
 python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
   --renderer-backend jax \
   --out-dir /tmp/pd_profile_jax_gpu_policy \
+  "${COMMON_ARGS[@]}"
+
+# 3) nvdiffrast renderer (Torch + nvdiffrast full-scene GPU MVP)
+python minimal_rap_bridge/render_pufferdrive_to_rap_mvp.py \
+  --renderer-backend nvdiffrast \
+  --out-dir /tmp/pd_profile_nvdiffrast_gpu_policy \
   "${COMMON_ARGS[@]}"
 ```
