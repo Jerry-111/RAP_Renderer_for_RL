@@ -155,8 +155,17 @@ def instantiate_renderer(backend: str,
         "height": height,
     }
     if backend == "nvdiffrast":
-        renderer_kwargs["use_gpu_full_scene"] = True
-        renderer_kwargs["enable_nvdiffrast_antialias"] = False
+        # Visual-correctness hotfix:
+        # keep GPU raster for cuboids/fills, but render line overlays on CPU
+        # to avoid ribbon-triangle artifacts in the current fast line path.
+        renderer_kwargs["use_gpu_full_scene"] = False
+        renderer_kwargs["use_gpu_cuboid_instances"] = True
+        renderer_kwargs["use_gpu_cuboid_batches"] = True
+        renderer_kwargs["use_gpu_filled_regions"] = True
+        renderer_kwargs["use_gpu_line_overlays"] = False
+        renderer_kwargs["use_gpu_arrows"] = False
+        # Visual-correctness hotfix default: keep opaque AA enabled for nvdiffrast.
+        renderer_kwargs["enable_nvdiffrast_antialias"] = True
         renderer_kwargs["quality_mode"] = nvdiffrast_quality_mode
     return renderer_cls(**renderer_kwargs)
 
@@ -1104,7 +1113,9 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
         replay_data = None
         if resolved_box_source == "map_replay":
             replay_data = load_map_replay_objects(scene_source)
-        use_world_static_map = cfg.renderer_backend == "nvdiffrast"
+        # Visual-correctness hotfix: force nvdiffrast to use the legacy ego-relative
+        # map contract until world-static z/alignment handling is redesigned.
+        use_world_static_map = False
         map_features_world_static = build_map_features_world_static(polylines_abs) if use_world_static_map else None
 
         if cfg.write_video:

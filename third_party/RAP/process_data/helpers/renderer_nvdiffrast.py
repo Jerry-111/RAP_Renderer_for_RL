@@ -1172,36 +1172,7 @@ class ScenarioRenderer:
             points_world = np.asarray(overlay.points_world, dtype=np.float32)
             if points_world.shape[0] < 2:
                 continue
-            if self.quality_mode == "perf" and overlay.cull_center_xy is not None:
-                center_world = np.array(
-                    [float(overlay.cull_center_xy[0]), float(overlay.cull_center_xy[1]), 0.0],
-                    dtype=np.float32,
-                )
-                center_cam = _transform_world_to_camera(center_world[None, :], camera.T_w2c)[0].astype(np.float32)
-                zc = float(center_cam[2])
-                if (zc + float(overlay.cull_radius_xy)) <= float(overlay.near):
-                    continue
-                if zc > float(overlay.near):
-                    u = float(camera.K[0, 0] * center_cam[0] / zc + camera.K[0, 2])
-                    v = float(camera.K[1, 1] * center_cam[1] / zc + camera.K[1, 2])
-                    rpx_u = float(camera.K[0, 0] * float(overlay.cull_radius_xy) / max(zc, float(overlay.near)))
-                    rpx_v = float(camera.K[1, 1] * float(overlay.cull_radius_xy) / max(zc, float(overlay.near)))
-                    margin = 96.0
-                    if (
-                        (u + rpx_u) < -margin
-                        or (u - rpx_u) > (float(camera.width) + margin)
-                        or (v + rpx_v) < -margin
-                        or (v - rpx_v) > (float(camera.height) + margin)
-                    ):
-                        continue
-
             pts_world = self._get_world_points_torch(points_world)
-            if self.quality_mode == "perf" and pts_world.shape[0] > 64:
-                # Perf mode allows slight overlay relaxation; decimate very dense polylines.
-                decimate_stride = 4 if pts_world.shape[0] > 256 else 2
-                pts_world = pts_world[::decimate_stride]
-                if pts_world.shape[0] < 2:
-                    continue
             if pts_world.shape[0] < 2:
                 continue
             pts_cam = pts_world @ cam_tensors["R"].T + cam_tensors["t"]
