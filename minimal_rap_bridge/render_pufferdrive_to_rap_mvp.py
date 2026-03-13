@@ -71,6 +71,7 @@ class BridgeConfig:
     max_scenes: int | None
     full_episode: bool
     renderer_backend: str
+    nvdiffrast_quality_mode: str
     profile_no_io: bool
 
 
@@ -146,7 +147,8 @@ def instantiate_renderer(backend: str,
                          renderer_cls,
                          camera_channel_list: List[str],
                          width: int,
-                         height: int):
+                         height: int,
+                         nvdiffrast_quality_mode: str = "perf"):
     renderer_kwargs = {
         "camera_channel_list": camera_channel_list,
         "width": width,
@@ -155,6 +157,7 @@ def instantiate_renderer(backend: str,
     if backend == "nvdiffrast":
         renderer_kwargs["use_gpu_full_scene"] = True
         renderer_kwargs["enable_nvdiffrast_antialias"] = False
+        renderer_kwargs["quality_mode"] = nvdiffrast_quality_mode
     return renderer_cls(**renderer_kwargs)
 
 
@@ -199,6 +202,13 @@ def parse_args() -> BridgeConfig:
         default="numpy",
         choices=["numpy", "jax", "nvdiffrast"],
         help="Renderer implementation backend: original NumPy renderer, JAX copy, or nvdiffrast full-scene GPU MVP",
+    )
+    parser.add_argument(
+        "--nvdiffrast-quality-mode",
+        type=str,
+        default="perf",
+        choices=["perf", "parity"],
+        help="nvdiffrast rendering quality preset: perf (faster, relaxed overlays) or parity (closer visuals).",
     )
     parser.add_argument("--ego-agent-index", type=int, default=0)
     parser.add_argument("--include-ego-box", action="store_true")
@@ -389,6 +399,7 @@ def parse_args() -> BridgeConfig:
         max_scenes=args.max_scenes,
         full_episode=args.full_episode,
         renderer_backend=args.renderer_backend,
+        nvdiffrast_quality_mode=args.nvdiffrast_quality_mode,
         profile_no_io=args.profile_no_io,
     )
 
@@ -459,10 +470,21 @@ def build_map_features(polylines_abs: Sequence[np.ndarray], ego_x: float, ego_y:
     return features
 
 
+def build_map_features_world_static(polylines_abs: Sequence[np.ndarray]) -> Dict[str, Dict[str, np.ndarray]]:
+    features: Dict[str, Dict[str, np.ndarray]] = {}
+    for idx, poly in enumerate(polylines_abs):
+        poly_abs = np.asarray(poly, dtype=np.float32)
+        if poly_abs.shape[0] < 2 or not np.isfinite(poly_abs).all():
+            continue
+        features[f"boundary_{idx:05d}"] = {"type": "BOUNDARY", "polyline": poly_abs}
+    return features
+
+
 def build_boxes_from_state(
     state: Dict[str, np.ndarray],
     ego_idx: int,
     include_ego_box: bool,
+    use_world_coords: bool = False,
     default_height: float = 1.6,
 ) -> tuple[np.ndarray, np.ndarray]:
     valid = valid_agent_indices(state)
@@ -478,14 +500,19 @@ def build_boxes_from_state(
     for i in valid:
         if (not include_ego_box) and int(i) == int(ego_idx):
             continue
-        rel_x = float(state["x"][i] - ego_x)
-        rel_y = float(state["y"][i] - ego_y)
-        rel_z = float(state["z"][i] - ego_z)
+        if use_world_coords:
+            box_x = float(state["x"][i])
+            box_y = float(state["y"][i])
+            box_z = float(state["z"][i])
+        else:
+            box_x = float(state["x"][i] - ego_x)
+            box_y = float(state["y"][i] - ego_y)
+            box_z = float(state["z"][i] - ego_z)
         boxes.append(
             [
-                rel_x,
-                rel_y,
-                rel_z,
+                box_x,
+                box_y,
+                box_z,
                 float(state["length"][i]),
                 float(state["width"][i]),
                 float(default_height),
@@ -503,35 +530,64 @@ def build_scenario(
     state: Dict[str, np.ndarray],
     ego_idx: int,
     include_ego_box: bool,
-    map_features: Dict[str, Dict[str, np.ndarray]],
+    map_features: Dict[str, Dict[str, np.ndarray]] | None,
+    map_features_world_static: Dict[str, Dict[str, np.ndarray]] | None = None,
+    use_world_boxes: bool = False,
+    scene_id: str | None = None,
 ) -> Dict:
-    gt_boxes_world, gt_names = build_boxes_from_state(state, ego_idx=ego_idx, include_ego_box=include_ego_box)
-    return {
+    gt_boxes_world, gt_names = build_boxes_from_state(
+        state,
+        ego_idx=ego_idx,
+        include_ego_box=include_ego_box,
+        use_world_coords=use_world_boxes,
+    )
+    scenario = {
         "ego_heading": float(state["heading"][ego_idx]),
         "traffic_lights": [],
-        "map_features": map_features,
+        "map_features": map_features if map_features is not None else {},
         "anns": {
             "gt_boxes_world": gt_boxes_world,
             "gt_names": gt_names,
         },
     }
+    if map_features_world_static is not None:
+        scenario["map_features_world_static"] = map_features_world_static
+        scenario["ego_pose"] = {
+            "x": float(state["x"][ego_idx]),
+            "y": float(state["y"][ego_idx]),
+            "z": float(state["z"][ego_idx]),
+            "heading": float(state["heading"][ego_idx]),
+        }
+    if scene_id is not None:
+        scenario["scene_id"] = scene_id
+    return scenario
 
 
 def build_scenario_from_boxes(
     ego_heading: float,
-    map_features: Dict[str, Dict[str, np.ndarray]],
+    map_features: Dict[str, Dict[str, np.ndarray]] | None,
     gt_boxes_world: np.ndarray,
     gt_names: np.ndarray,
+    map_features_world_static: Dict[str, Dict[str, np.ndarray]] | None = None,
+    ego_pose: Dict[str, float] | None = None,
+    scene_id: str | None = None,
 ) -> Dict:
-    return {
+    scenario = {
         "ego_heading": float(ego_heading),
         "traffic_lights": [],
-        "map_features": map_features,
+        "map_features": map_features if map_features is not None else {},
         "anns": {
             "gt_boxes_world": gt_boxes_world,
             "gt_names": gt_names,
         },
     }
+    if map_features_world_static is not None:
+        scenario["map_features_world_static"] = map_features_world_static
+    if ego_pose is not None:
+        scenario["ego_pose"] = ego_pose
+    if scene_id is not None:
+        scenario["scene_id"] = scene_id
+    return scenario
 
 
 def _read_exact(fh, nbytes: int) -> bytes:
@@ -609,6 +665,7 @@ def build_boxes_from_map_replay(
     ego_y: float,
     ego_z: float,
     include_ego_box: bool,
+    use_world_coords: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     objects = replay_data["objects"]
     sdc_track_index = int(replay_data["sdc_track_index"])
@@ -639,7 +696,11 @@ def build_boxes_from_map_replay(
         if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(z) and np.isfinite(heading)):
             continue
 
-        boxes.append([x - ego_x, y - ego_y, z - ego_z, length, width, 1.6, heading])
+        if use_world_coords:
+            box_x, box_y, box_z = x, y, z
+        else:
+            box_x, box_y, box_z = x - ego_x, y - ego_y, z - ego_z
+        boxes.append([box_x, box_y, box_z, length, width, 1.6, heading])
         obj_type = int(obj["type"])
         if obj_type == 1:
             names.append("vehicle")
@@ -1032,6 +1093,7 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             camera_channel_list=cfg.cameras,
             width=render_width,
             height=render_height,
+            nvdiffrast_quality_mode=cfg.nvdiffrast_quality_mode,
         )
         action_source = create_action_source(cfg, env)
         obs = np.array(env.observations, copy=True)
@@ -1042,6 +1104,8 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
         replay_data = None
         if resolved_box_source == "map_replay":
             replay_data = load_map_replay_objects(scene_source)
+        use_world_static_map = cfg.renderer_backend == "nvdiffrast"
+        map_features_world_static = build_map_features_world_static(polylines_abs) if use_world_static_map else None
 
         if cfg.write_video:
             video_writers = open_video_writers(
@@ -1085,6 +1149,8 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             f"save_frames={cfg.save_frames}"
         )
         print(f"renderer_backend={cfg.renderer_backend}")
+        if cfg.renderer_backend == "nvdiffrast":
+            print(f"nvdiffrast_quality_mode={cfg.nvdiffrast_quality_mode}")
         print(f"profile_no_io={cfg.profile_no_io}")
 
         scene_start = time.perf_counter()
@@ -1094,15 +1160,19 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
         inference_calls = 0
         step_total_ms = 0.0
         step_calls = 0
+        renderer_bucket_totals_ms: Dict[str, float] = {}
+        renderer_bucket_counts: Dict[str, int] = {}
 
         for frame_idx in range(cfg.frames):
             state = env.get_global_agent_state()
             ego_idx = resolve_ego_index_by_id(state, ego_id=ego_id, fallback_idx=ego_idx)
             ego_x = float(state["x"][ego_idx])
             ego_y = float(state["y"][ego_idx])
-            map_features = build_map_features(polylines_abs, ego_x=ego_x, ego_y=ego_y)
-            if not map_features:
-                raise RuntimeError(f"No map features available at frame={frame_idx}")
+            map_features = None
+            if not use_world_static_map:
+                map_features = build_map_features(polylines_abs, ego_x=ego_x, ego_y=ego_y)
+                if not map_features:
+                    raise RuntimeError(f"No map features available at frame={frame_idx}")
 
             if replay_data is not None:
                 gt_boxes_world, gt_names = build_boxes_from_map_replay(
@@ -1112,12 +1182,21 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
                     ego_y=ego_y,
                     ego_z=float(state["z"][ego_idx]),
                     include_ego_box=cfg.include_ego_box,
+                    use_world_coords=use_world_static_map,
                 )
                 scenario = build_scenario_from_boxes(
                     ego_heading=float(state["heading"][ego_idx]),
                     map_features=map_features,
                     gt_boxes_world=gt_boxes_world,
                     gt_names=gt_names,
+                    map_features_world_static=map_features_world_static,
+                    ego_pose={
+                        "x": float(state["x"][ego_idx]),
+                        "y": float(state["y"][ego_idx]),
+                        "z": float(state["z"][ego_idx]),
+                        "heading": float(state["heading"][ego_idx]),
+                    } if use_world_static_map else None,
+                    scene_id=scene_name,
                 )
             else:
                 scenario = build_scenario(
@@ -1125,11 +1204,23 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
                     ego_idx=ego_idx,
                     include_ego_box=cfg.include_ego_box,
                     map_features=map_features,
+                    map_features_world_static=map_features_world_static,
+                    use_world_boxes=use_world_static_map,
+                    scene_id=scene_name,
                 )
             t0 = time.perf_counter()
             rendered = renderer.observe(scenario)
             render_total_ms += (time.perf_counter() - t0) * 1000.0
             render_calls += 1
+            if hasattr(renderer, "get_perf_stats"):
+                try:
+                    frame_stats = renderer.get_perf_stats(reset=True)
+                except TypeError:
+                    frame_stats = renderer.get_perf_stats()
+                if isinstance(frame_stats, dict):
+                    for k, v in frame_stats.items():
+                        renderer_bucket_totals_ms[k] = renderer_bucket_totals_ms.get(k, 0.0) + float(v)
+                        renderer_bucket_counts[k] = renderer_bucket_counts.get(k, 0) + 1
             if cfg.save_frames:
                 save_frame_images(cfg.out_dir, frame_idx, rendered)
             if cfg.write_video:
@@ -1160,6 +1251,18 @@ def run_single_scene(cfg: BridgeConfig, scene_name: str, scene_source: Path) -> 
             f"step_avg_ms={step_avg_ms:.3f}, "
             f"rap_renderer_avg_ms={render_avg_ms:.3f}"
         )
+        if renderer_bucket_totals_ms:
+            bucket_avg = {
+                k: renderer_bucket_totals_ms[k] / max(renderer_bucket_counts.get(k, 1), 1)
+                for k in sorted(renderer_bucket_totals_ms.keys())
+            }
+            bucket_line = ", ".join(f"{k}={v:.3f}ms" for k, v in bucket_avg.items())
+            print(f"[renderer_breakdown] {bucket_line}")
+            warn_threshold_ms = 8.0
+            heavy = {k: v for k, v in bucket_avg.items() if v > warn_threshold_ms}
+            if heavy:
+                heavy_line = ", ".join(f"{k}={v:.3f}ms" for k, v in sorted(heavy.items()))
+                print(f"[renderer_breakdown][warn] bucket over 40% of 20ms budget: {heavy_line}")
 
         return {
             "scene_name": scene_name,

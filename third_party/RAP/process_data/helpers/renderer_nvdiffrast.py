@@ -20,7 +20,8 @@ from tqdm import tqdm
 from numpy import array
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple, Any
+import time
 
 
 @dataclass
@@ -33,6 +34,7 @@ class CameraState:
     T_w2c: np.ndarray
     cam_t: np.ndarray
     cam_R: np.ndarray
+    lidar_pos: np.ndarray
 
 
 @dataclass
@@ -43,6 +45,8 @@ class LineOverlay:
     radius: int = 8
     near: float = 1e-3
     depth_max: float = 80.0
+    cull_center_xy: Optional[np.ndarray] = None
+    cull_radius_xy: float = 0.0
 
 
 @dataclass
@@ -145,6 +149,14 @@ class LoweredCameraScene:
         return sum(batch.triangle_count for batch in self.filled_triangle_batches) + \
             sum(batch.triangle_count for batch in self.cuboid_triangle_batches) + \
             sum(batch.triangle_count for batch in self.overlay_triangle_batches)
+
+
+@dataclass
+class SceneStaticCacheEntry:
+    line_overlays: List[LineOverlay]
+    filled_regions: List[FilledRegion]
+    cuboid_instances: List[CuboidInstance]
+    render_order: List[RenderOpRef]
 
 def build_se3(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     """4×4 SE(3) 齐次矩阵"""
@@ -905,6 +917,7 @@ class ScenarioRenderer:
                  use_gpu_filled_regions: bool = False,
                  use_gpu_line_overlays: bool = False,
                  use_gpu_arrows: bool = False,
+                 quality_mode: str = "parity",
                  torch_device: str = "cuda",
                  enable_nvdiffrast_antialias: bool = True):
         self.width = width
@@ -916,6 +929,7 @@ class ScenarioRenderer:
         self.use_gpu_filled_regions = use_gpu_filled_regions
         self.use_gpu_line_overlays = use_gpu_line_overlays
         self.use_gpu_arrows = use_gpu_arrows
+        self.quality_mode = quality_mode
         if use_gpu_full_scene:
             self.use_gpu_cuboid_batches = True
             self.use_gpu_filled_regions = True
@@ -927,6 +941,10 @@ class ScenarioRenderer:
         self._torch = None
         self._dr = None
         self._dr_ctx = None
+        self._scene_static_cache: Dict[Tuple[Any, ...], SceneStaticCacheEntry] = {}
+        self._line_points_torch_cache: Dict[int, Any] = {}
+        self._perf_last: Dict[str, float] = {}
+        self._cache_scope: Optional[Tuple[Any, ...]] = None
         for k, v in camera_params.items():
             if not k in camera_channel_list: continue
             self.camera_models[k] = v
@@ -934,6 +952,19 @@ class ScenarioRenderer:
     @staticmethod
     def _ground_points_from_poly2d(poly2d: np.ndarray) -> np.ndarray:
         return np.hstack([poly2d, np.zeros((poly2d.shape[0], 1), np.float32)])
+
+    @staticmethod
+    def _polyline_cull_circle(points: np.ndarray) -> tuple[np.ndarray, float]:
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[0] == 0:
+            return np.zeros(2, dtype=np.float32), 0.0
+        if pts.shape[1] >= 2:
+            pts_xy = pts[:, :2]
+        else:
+            return np.zeros(2, dtype=np.float32), 0.0
+        center = np.mean(pts_xy, axis=0, dtype=np.float32)
+        radius = float(np.max(np.linalg.norm(pts_xy - center[None, :], axis=1))) if pts_xy.shape[0] else 0.0
+        return center.astype(np.float32), radius
 
     @staticmethod
     def _traffic_light_world_corners(cuboid: CuboidInstance) -> np.ndarray:
@@ -997,6 +1028,318 @@ class ScenarioRenderer:
             tri_colors.extend([color.copy(), color.copy()])
 
         return _make_triangle_batch(overlay.semantic_tag, "line_overlay", tri_vertices, tri_depths, tri_colors)
+
+    def _get_world_points_torch(self, points_world: np.ndarray):
+        torch, _ = self._lazy_import_torch_raster()
+        cache_key = id(points_world)
+        cached = self._line_points_torch_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        pts = torch.as_tensor(np.asarray(points_world, dtype=np.float32), dtype=torch.float32, device=self.torch_device)
+        self._line_points_torch_cache[cache_key] = pts
+        return pts
+
+    def _build_camera_tensors(self, camera: CameraState):
+        torch, _ = self._lazy_import_torch_raster()
+        device = torch.device(self.torch_device)
+        K = torch.as_tensor(camera.K, dtype=torch.float32, device=device)
+        T = torch.as_tensor(camera.T_w2c, dtype=torch.float32, device=device)
+        return {
+            "R": T[:3, :3],
+            "t": T[:3, 3],
+            "fx": K[0, 0],
+            "fy": K[1, 1],
+            "cx": K[0, 2],
+            "cy": K[1, 2],
+            "W": float(camera.width),
+            "H": float(camera.height),
+        }
+
+    def _collect_line_overlays_for_gpu(self, packet: CameraScenePacket) -> List[LineOverlay]:
+        overlays = list(packet.line_overlays)
+        for region in packet.filled_regions:
+            if region.outline_color is None:
+                continue
+            cull_center, cull_radius = self._polyline_cull_circle(region.points_world)
+            overlays.append(
+                LineOverlay(
+                    semantic_tag=f"{region.semantic_tag}_outline",
+                    points_world=region.points_world,
+                    color=region.outline_color,
+                    radius=region.outline_radius,
+                    near=region.outline_near,
+                    depth_max=region.depth_max,
+                    cull_center_xy=cull_center,
+                    cull_radius_xy=cull_radius,
+                )
+            )
+        return overlays
+
+    def _lower_line_overlay_torch(self, overlay: LineOverlay, cam_tensors):
+        torch, _ = self._lazy_import_torch_raster()
+        pts_world = self._get_world_points_torch(overlay.points_world)
+        if pts_world.shape[0] < 2:
+            return None
+
+        pts_cam = pts_world @ cam_tensors["R"].T + cam_tensors["t"]
+        p1 = pts_cam[:-1]
+        p2 = pts_cam[1:]
+        z1 = p1[:, 2]
+        z2 = p2[:, 2]
+        near = float(overlay.near)
+
+        visible_seg = ~((z1 < near) & (z2 < near))
+        if not torch.any(visible_seg):
+            return None
+
+        p1 = p1[visible_seg]
+        p2 = p2[visible_seg]
+        z1 = z1[visible_seg]
+        z2 = z2[visible_seg]
+
+        denom = z2 - z1
+        safe = torch.where(torch.abs(denom) < 1e-6, torch.full_like(denom, 1e-6), denom)
+        t = (near - z1) / safe
+        inter = p1 + t[:, None] * (p2 - p1)
+
+        clip_p1 = (z1 < near) & (z2 >= near)
+        clip_p2 = (z2 < near) & (z1 >= near)
+        p1 = torch.where(clip_p1[:, None], inter, p1)
+        p2 = torch.where(clip_p2[:, None], inter, p2)
+        z1 = torch.where(clip_p1, torch.full_like(z1, near), z1)
+        z2 = torch.where(clip_p2, torch.full_like(z2, near), z2)
+
+        u1 = cam_tensors["fx"] * p1[:, 0] / z1 + cam_tensors["cx"]
+        v1 = cam_tensors["fy"] * p1[:, 1] / z1 + cam_tensors["cy"]
+        u2 = cam_tensors["fx"] * p2[:, 0] / z2 + cam_tensors["cx"]
+        v2 = cam_tensors["fy"] * p2[:, 1] / z2 + cam_tensors["cy"]
+        uv1 = torch.stack([u1, v1], dim=1)
+        uv2 = torch.stack([u2, v2], dim=1)
+
+        dir_uv = uv2 - uv1
+        seg_len = torch.linalg.norm(dir_uv, dim=1)
+        valid_len = seg_len > 1e-6
+
+        min_u = torch.minimum(u1, u2)
+        max_u = torch.maximum(u1, u2)
+        min_v = torch.minimum(v1, v2)
+        max_v = torch.maximum(v1, v2)
+        in_view = (max_u >= 0.0) & (min_u < cam_tensors["W"]) & (max_v >= 0.0) & (min_v < cam_tensors["H"])
+        keep = valid_len & in_view
+        if not torch.any(keep):
+            return None
+
+        uv1 = uv1[keep]
+        uv2 = uv2[keep]
+        z1 = z1[keep]
+        z2 = z2[keep]
+        dir_uv = dir_uv[keep]
+        seg_len = seg_len[keep]
+
+        half_width = max(float(overlay.radius), 1.0) * 0.5
+        normal = torch.stack([-dir_uv[:, 1], dir_uv[:, 0]], dim=1) / seg_len[:, None]
+        offset = normal * half_width
+
+        quad = torch.stack([uv1 + offset, uv1 - offset, uv2 - offset, uv2 + offset], dim=1)
+        depth = torch.stack([z1, z1, z2, z2], dim=1)
+
+        tri_pos = torch.cat([quad[:, [0, 1, 2], :], quad[:, [0, 2, 3], :]], dim=0)
+        tri_depth = torch.cat([depth[:, [0, 1, 2]], depth[:, [0, 2, 3]]], dim=0)
+
+        depth_mean = torch.clamp((z1 + z2) * 0.5, 0.0, float(overlay.depth_max))
+        alpha = torch.clamp((float(overlay.depth_max) - depth_mean) / max(float(overlay.depth_max), 1e-6), 0.0, 1.0)
+        base_color = torch.as_tensor(np.asarray(overlay.color, dtype=np.float32), dtype=torch.float32, device=tri_pos.device)
+        seg_color = alpha[:, None] * base_color[None, :]
+        tri_color = seg_color.repeat_interleave(2, dim=0)
+        tri_color = tri_color[:, None, :].expand(-1, 3, -1)
+        return tri_pos, tri_depth, tri_color
+
+    def _lower_line_overlays_torch_batched(self,
+                                           overlays: List[LineOverlay],
+                                           camera: CameraState,
+                                           cam_tensors):
+        torch, _ = self._lazy_import_torch_raster()
+        device = torch.device(self.torch_device)
+
+        p1_chunks = []
+        p2_chunks = []
+        near_chunks = []
+        depth_max_chunks = []
+        half_width_chunks = []
+        color_chunks = []
+
+        for overlay in overlays:
+            points_world = np.asarray(overlay.points_world, dtype=np.float32)
+            if points_world.shape[0] < 2:
+                continue
+            if self.quality_mode == "perf" and overlay.cull_center_xy is not None:
+                center_world = np.array(
+                    [float(overlay.cull_center_xy[0]), float(overlay.cull_center_xy[1]), 0.0],
+                    dtype=np.float32,
+                )
+                center_cam = _transform_world_to_camera(center_world[None, :], camera.T_w2c)[0].astype(np.float32)
+                zc = float(center_cam[2])
+                if (zc + float(overlay.cull_radius_xy)) <= float(overlay.near):
+                    continue
+                if zc > float(overlay.near):
+                    u = float(camera.K[0, 0] * center_cam[0] / zc + camera.K[0, 2])
+                    v = float(camera.K[1, 1] * center_cam[1] / zc + camera.K[1, 2])
+                    rpx_u = float(camera.K[0, 0] * float(overlay.cull_radius_xy) / max(zc, float(overlay.near)))
+                    rpx_v = float(camera.K[1, 1] * float(overlay.cull_radius_xy) / max(zc, float(overlay.near)))
+                    margin = 96.0
+                    if (
+                        (u + rpx_u) < -margin
+                        or (u - rpx_u) > (float(camera.width) + margin)
+                        or (v + rpx_v) < -margin
+                        or (v - rpx_v) > (float(camera.height) + margin)
+                    ):
+                        continue
+
+            pts_world = self._get_world_points_torch(points_world)
+            if self.quality_mode == "perf" and pts_world.shape[0] > 64:
+                # Perf mode allows slight overlay relaxation; decimate very dense polylines.
+                decimate_stride = 4 if pts_world.shape[0] > 256 else 2
+                pts_world = pts_world[::decimate_stride]
+                if pts_world.shape[0] < 2:
+                    continue
+            if pts_world.shape[0] < 2:
+                continue
+            pts_cam = pts_world @ cam_tensors["R"].T + cam_tensors["t"]
+            seg_count = int(pts_cam.shape[0]) - 1
+            if seg_count <= 0:
+                continue
+            p1_chunks.append(pts_cam[:-1])
+            p2_chunks.append(pts_cam[1:])
+            near_chunks.append(torch.full((seg_count,), float(overlay.near), dtype=torch.float32, device=device))
+            depth_max_chunks.append(torch.full((seg_count,), float(overlay.depth_max), dtype=torch.float32, device=device))
+            half_width_chunks.append(
+                torch.full((seg_count,), max(float(overlay.radius), 1.0) * 0.5, dtype=torch.float32, device=device)
+            )
+            base_color = torch.as_tensor(
+                np.asarray(overlay.color, dtype=np.float32),
+                dtype=torch.float32,
+                device=device,
+            )
+            color_chunks.append(base_color[None, :].expand(seg_count, -1))
+
+        if not p1_chunks:
+            return None
+
+        p1 = torch.cat(p1_chunks, dim=0)
+        p2 = torch.cat(p2_chunks, dim=0)
+        near = torch.cat(near_chunks, dim=0)
+        depth_max = torch.cat(depth_max_chunks, dim=0)
+        half_width = torch.cat(half_width_chunks, dim=0)
+        base_color = torch.cat(color_chunks, dim=0)
+
+        z1 = p1[:, 2]
+        z2 = p2[:, 2]
+        visible_seg = ~((z1 < near) & (z2 < near))
+        p1 = p1[visible_seg]
+        p2 = p2[visible_seg]
+        z1 = z1[visible_seg]
+        z2 = z2[visible_seg]
+        near = near[visible_seg]
+        depth_max = depth_max[visible_seg]
+        half_width = half_width[visible_seg]
+        base_color = base_color[visible_seg]
+        if p1.shape[0] == 0:
+            return None
+
+        denom = z2 - z1
+        safe = torch.where(torch.abs(denom) < 1e-6, torch.full_like(denom, 1e-6), denom)
+        t = (near - z1) / safe
+        inter = p1 + t[:, None] * (p2 - p1)
+        clip_p1 = (z1 < near) & (z2 >= near)
+        clip_p2 = (z2 < near) & (z1 >= near)
+        p1 = torch.where(clip_p1[:, None], inter, p1)
+        p2 = torch.where(clip_p2[:, None], inter, p2)
+        z1 = torch.where(clip_p1, near, z1)
+        z2 = torch.where(clip_p2, near, z2)
+
+        u1 = cam_tensors["fx"] * p1[:, 0] / z1 + cam_tensors["cx"]
+        v1 = cam_tensors["fy"] * p1[:, 1] / z1 + cam_tensors["cy"]
+        u2 = cam_tensors["fx"] * p2[:, 0] / z2 + cam_tensors["cx"]
+        v2 = cam_tensors["fy"] * p2[:, 1] / z2 + cam_tensors["cy"]
+        uv1 = torch.stack([u1, v1], dim=1)
+        uv2 = torch.stack([u2, v2], dim=1)
+
+        dir_uv = uv2 - uv1
+        seg_len = torch.linalg.norm(dir_uv, dim=1)
+        min_u = torch.minimum(u1, u2)
+        max_u = torch.maximum(u1, u2)
+        min_v = torch.minimum(v1, v2)
+        max_v = torch.maximum(v1, v2)
+        in_view = (max_u >= 0.0) & (min_u < cam_tensors["W"]) & (max_v >= 0.0) & (min_v < cam_tensors["H"])
+        keep = (seg_len > 1e-6) & in_view
+        uv1 = uv1[keep]
+        uv2 = uv2[keep]
+        z1 = z1[keep]
+        z2 = z2[keep]
+        seg_len = seg_len[keep]
+        half_width = half_width[keep]
+        depth_max = depth_max[keep]
+        base_color = base_color[keep]
+        dir_uv = dir_uv[keep]
+        if uv1.shape[0] == 0:
+            return None
+
+        normal = torch.stack([-dir_uv[:, 1], dir_uv[:, 0]], dim=1) / seg_len[:, None]
+        offset = normal * half_width[:, None]
+        quad = torch.stack([uv1 + offset, uv1 - offset, uv2 - offset, uv2 + offset], dim=1)
+        depth = torch.stack([z1, z1, z2, z2], dim=1)
+
+        tri_pos = torch.cat([quad[:, [0, 1, 2], :], quad[:, [0, 2, 3], :]], dim=0)
+        tri_depth = torch.cat([depth[:, [0, 1, 2]], depth[:, [0, 2, 3]]], dim=0)
+        depth_mid = (z1 + z2) * 0.5
+        depth_mean = torch.minimum(torch.maximum(depth_mid, torch.zeros_like(depth_mid)), depth_max)
+        alpha = torch.clamp((depth_max - depth_mean) / torch.clamp(depth_max, min=1e-6), 0.0, 1.0)
+        seg_color = alpha[:, None] * base_color
+        tri_color = seg_color.repeat_interleave(2, dim=0)
+        tri_color = tri_color[:, None, :].expand(-1, 3, -1)
+        return tri_pos, tri_depth, tri_color
+
+    def _rasterize_line_overlays_fast(self,
+                                      overlays: List[LineOverlay],
+                                      camera: CameraState):
+        if not overlays:
+            return None
+
+        t_lower = time.perf_counter()
+        torch, dr = self._lazy_import_torch_raster()
+        ctx = self._get_raster_context()
+        cam_tensors = self._build_camera_tensors(camera)
+        lowered = self._lower_line_overlays_torch_batched(overlays, camera, cam_tensors)
+        self._perf_add("lower_lines_ms", (time.perf_counter() - t_lower) * 1000.0)
+        if lowered is None:
+            return None
+
+        t_raster = time.perf_counter()
+        tri_pos, tri_depth, tri_color = lowered
+
+        verts_px = tri_pos.reshape(-1, 2)
+        verts_depth = tri_depth.reshape(-1)
+        verts_color = tri_color.reshape(-1, 3) / 255.0
+
+        x = (verts_px[:, 0] / max(float(camera.width), 1.0)) * 2.0 - 1.0
+        y = 1.0 - (verts_px[:, 1] / max(float(camera.height), 1.0)) * 2.0
+        z = torch.clamp(verts_depth / max(float(camera.depth_max), 1e-6), 0.0, 1.0) * 2.0 - 1.0
+        w = torch.ones_like(z)
+        pos = torch.stack([x, y, z, w], dim=1).unsqueeze(0)
+        tri = torch.arange(verts_px.shape[0], device=verts_px.device, dtype=torch.int32).reshape(-1, 3)
+        color = verts_color.unsqueeze(0)
+
+        rast, rast_db = dr.rasterize(ctx, pos, tri, resolution=[camera.height, camera.width])
+        color_img, _ = dr.interpolate(color, rast, tri, rast_db=rast_db)
+        use_overlay_aa = self.enable_nvdiffrast_antialias and self.quality_mode != "perf"
+        if use_overlay_aa:
+            color_img = dr.antialias(color_img, rast, pos, tri)
+        alpha = (rast[..., 3:4] > 0).to(color_img.dtype)
+        rgba = torch.cat([color_img * alpha, alpha], dim=-1)
+        rgba = torch.flip(rgba[0], dims=[0])
+        rgba = torch.clamp(rgba, 0.0, 1.0).mul(255.0).byte()
+        self._perf_add("raster_overlay_ms", (time.perf_counter() - t_raster) * 1000.0)
+        return rgba
 
     def _lower_filled_region_to_triangle_batch(self,
                                                camera: CameraState,
@@ -1175,6 +1518,7 @@ class ScenarioRenderer:
         lowered = LoweredCameraScene(camera=packet.camera)
 
         if include_filled_regions or include_line_overlays:
+            t0 = time.perf_counter()
             for region in packet.filled_regions:
                 if include_filled_regions:
                     batch = self._lower_filled_region_to_triangle_batch(packet.camera, region)
@@ -1192,30 +1536,43 @@ class ScenarioRenderer:
                     outline_batch = self._lower_line_overlay_to_triangle_batch(packet.camera, outline)
                     if outline_batch is not None:
                         lowered.overlay_triangle_batches.append(outline_batch)
+            self._perf_add("lower_filled_ms", (time.perf_counter() - t0) * 1000.0)
 
         if include_cuboid_instances:
+            t0 = time.perf_counter()
             for cuboid in packet.cuboid_instances:
                 batch = self._lower_cuboid_instance_to_triangle_batch(packet.camera, cuboid)
                 if batch is not None:
                     lowered.cuboid_triangle_batches.append(batch)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._perf_add("lower_cuboid_instances_ms", dt_ms)
+            self._perf_add("lower_cuboids_ms", dt_ms)
 
         if include_cuboid_batches:
+            t0 = time.perf_counter()
             for cuboid_batch in packet.cuboid_batches:
                 batch = self._lower_cuboid_batch_to_triangle_batch(packet.camera, cuboid_batch)
                 if batch is not None:
                     lowered.cuboid_triangle_batches.append(batch)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            self._perf_add("lower_cuboid_batches_ms", dt_ms)
+            self._perf_add("lower_cuboids_ms", dt_ms)
 
         if include_line_overlays:
+            t0 = time.perf_counter()
             for overlay in packet.line_overlays:
                 batch = self._lower_line_overlay_to_triangle_batch(packet.camera, overlay)
                 if batch is not None:
                     lowered.overlay_triangle_batches.append(batch)
+            self._perf_add("lower_lines_ms", (time.perf_counter() - t0) * 1000.0)
 
         if include_arrows:
+            t0 = time.perf_counter()
             for arrow in packet.arrow_overlays:
                 batch = self._lower_arrow_to_triangle_batch(packet.camera, arrow)
                 if batch is not None:
                     lowered.overlay_triangle_batches.append(batch)
+            self._perf_add("lower_arrows_ms", (time.perf_counter() - t0) * 1000.0)
 
         return lowered
 
@@ -1328,6 +1685,18 @@ class ScenarioRenderer:
             self.use_gpu_arrows,
         ])
 
+    def _perf_reset(self) -> None:
+        self._perf_last = {}
+
+    def _perf_add(self, key: str, ms: float) -> None:
+        self._perf_last[key] = self._perf_last.get(key, 0.0) + float(ms)
+
+    def get_perf_stats(self, reset: bool = False) -> Dict[str, float]:
+        stats = dict(self._perf_last)
+        if reset:
+            self._perf_last = {}
+        return stats
+
     @staticmethod
     def _composite_rgba_over_canvas(canvas: np.ndarray, rgba: Optional[np.ndarray]) -> np.ndarray:
         if rgba is None:
@@ -1375,10 +1744,11 @@ class ScenarioRenderer:
             T_w2c=T_w2c,
             cam_t=cam_t,
             cam_R=cam_R,
+            lidar_pos=np.asarray(lidar_pos, dtype=np.float32),
         )
 
-    def _append_traffic_light_primitives(self, packet: CameraScenePacket, scenario) -> None:
-        for feat in scenario['traffic_lights']:
+    def _append_traffic_light_primitives(self, packet: CameraScenePacket, traffic_lights) -> None:
+        for feat in traffic_lights:
             is_red = feat[1]
             xy = feat[2]
             z_base = 5
@@ -1395,14 +1765,20 @@ class ScenarioRenderer:
                 )
             )
 
-    def _append_map_primitives(self, packet: CameraScenePacket, scenario, lidar_pos) -> None:
-        for feat in scenario['map_features'].values():
+    def _append_map_primitives(self,
+                               packet: CameraScenePacket,
+                               map_features: Dict[str, Dict[str, np.ndarray]],
+                               lidar_pos: np.ndarray,
+                               apply_distance_cull: bool = True) -> None:
+        for feat in map_features.values():
             ftype = feat['type']
             if 'LANE' in ftype:
                 poly2d = feat['polygon'].astype(np.float32)
-                pts_dist = np.linalg.norm(poly2d - lidar_pos[np.newaxis, :2], axis=1)
-                if np.min(pts_dist) > self.depth_max:
-                    continue
+                if apply_distance_cull:
+                    pts_dist = np.linalg.norm(poly2d - lidar_pos[np.newaxis, :2], axis=1)
+                    if np.min(pts_dist) > self.depth_max:
+                        continue
+                cull_center, cull_radius = self._polyline_cull_circle(poly2d)
                 packet.add_line_overlay(
                     LineOverlay(
                         semantic_tag=ftype,
@@ -1410,6 +1786,8 @@ class ScenarioRenderer:
                         color=COLOR_TABLE['lanelines'].copy(),
                         radius=2,
                         depth_max=self.depth_max,
+                        cull_center_xy=cull_center,
+                        cull_radius_xy=cull_radius,
                     )
                 )
             elif 'CROSSWALK' in ftype or 'SPEED_BUMP' in ftype:
@@ -1425,6 +1803,7 @@ class ScenarioRenderer:
                 )
             elif 'BOUNDARY' in ftype or 'SOLID' in ftype:
                 poly2d = feat['polyline'].astype(np.float32)
+                cull_center, cull_radius = self._polyline_cull_circle(poly2d)
                 packet.add_line_overlay(
                     LineOverlay(
                         semantic_tag=ftype,
@@ -1432,6 +1811,8 @@ class ScenarioRenderer:
                         color=COLOR_TABLE['road_boundaries'].copy(),
                         radius=10,
                         depth_max=self.depth_max,
+                        cull_center_xy=cull_center,
+                        cull_radius_xy=cull_radius,
                     )
                 )
 
@@ -1445,7 +1826,38 @@ class ScenarioRenderer:
             )
         )
 
-    def _build_scene_template_packet(self, scenario, lidar_pos) -> CameraScenePacket:
+    @staticmethod
+    def _resolve_lidar_pose(scenario) -> tuple[np.ndarray, float]:
+        ego_pose = scenario.get("ego_pose")
+        if ego_pose is not None:
+            pos = np.array(
+                [
+                    float(ego_pose.get("x", 0.0)),
+                    float(ego_pose.get("y", 0.0)),
+                    float(ego_pose.get("z", 0.0)),
+                ],
+                dtype=np.float32,
+            )
+            yaw = float(ego_pose.get("heading", scenario.get("ego_heading", 0.0)))
+            return pos, yaw
+        return np.zeros(3, dtype=np.float32), float(scenario["ego_heading"])
+
+    @staticmethod
+    def _resolve_map_features_for_scene(scenario) -> tuple[Dict[str, Dict[str, np.ndarray]], bool]:
+        world_static = scenario.get("map_features_world_static")
+        if world_static is not None:
+            return world_static, True
+        return scenario.get("map_features", {}), False
+
+    def _make_static_cache_key(self, scenario) -> Tuple[Any, ...]:
+        scene_id = scenario.get("scene_id", "__unknown_scene__")
+        return (scene_id, "__shared__", self.width, self.height, float(self.depth_max), self.quality_mode)
+
+    def _build_scene_template_packet(self,
+                                     map_features: Dict[str, Dict[str, np.ndarray]],
+                                     traffic_lights,
+                                     lidar_pos: np.ndarray,
+                                     apply_distance_cull: bool) -> CameraScenePacket:
         template_camera = CameraState(
             camera_id="__template__",
             width=self.width,
@@ -1455,12 +1867,37 @@ class ScenarioRenderer:
             T_w2c=np.eye(4, dtype=np.float32),
             cam_t=np.zeros(3, dtype=np.float32),
             cam_R=np.eye(3, dtype=np.float32),
+            lidar_pos=np.zeros(3, dtype=np.float32),
         )
         packet = CameraScenePacket(camera=template_camera)
-        self._append_traffic_light_primitives(packet, scenario)
-        self._append_map_primitives(packet, scenario, lidar_pos)
-        self._append_annotation_primitives(packet, scenario)
+        self._append_traffic_light_primitives(packet, traffic_lights)
+        self._append_map_primitives(packet, map_features, lidar_pos, apply_distance_cull=apply_distance_cull)
         return packet
+
+    def _get_or_build_scene_static_cache_entry(self,
+                                               scenario,
+                                               lidar_pos: np.ndarray,
+                                               world_static_map: bool) -> SceneStaticCacheEntry:
+        cache_key = self._make_static_cache_key(scenario)
+        cached = self._scene_static_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        map_features, _ = self._resolve_map_features_for_scene(scenario)
+        template = self._build_scene_template_packet(
+            map_features=map_features,
+            traffic_lights=scenario.get("traffic_lights", []),
+            lidar_pos=lidar_pos,
+            apply_distance_cull=not world_static_map,
+        )
+        entry = SceneStaticCacheEntry(
+            line_overlays=template.line_overlays,
+            filled_regions=template.filled_regions,
+            cuboid_instances=template.cuboid_instances,
+            render_order=template.render_order,
+        )
+        self._scene_static_cache[cache_key] = entry
+        return entry
 
     def _build_camera_scene_packet(self,
                                    cam_id,
@@ -1468,23 +1905,26 @@ class ScenarioRenderer:
                                    scenario,
                                    lidar_pos,
                                    lidar_yaw,
-                                   scene_template_packet: Optional[CameraScenePacket] = None) -> CameraScenePacket:
+                                   scene_template_packet: Optional[SceneStaticCacheEntry] = None) -> CameraScenePacket:
         camera_state = self._build_camera_state(cam_id, cam_model, lidar_pos, lidar_yaw)
         if scene_template_packet is None:
             packet = CameraScenePacket(camera=camera_state)
-            self._append_traffic_light_primitives(packet, scenario)
-            self._append_map_primitives(packet, scenario, lidar_pos)
+            map_features, world_static_map = self._resolve_map_features_for_scene(scenario)
+            self._append_traffic_light_primitives(packet, scenario.get("traffic_lights", []))
+            self._append_map_primitives(packet, map_features, lidar_pos, apply_distance_cull=not world_static_map)
             self._append_annotation_primitives(packet, scenario)
             return packet
-        return CameraScenePacket(
+        packet = CameraScenePacket(
             camera=camera_state,
-            line_overlays=scene_template_packet.line_overlays,
-            filled_regions=scene_template_packet.filled_regions,
-            cuboid_instances=scene_template_packet.cuboid_instances,
-            cuboid_batches=scene_template_packet.cuboid_batches,
-            arrow_overlays=scene_template_packet.arrow_overlays,
-            render_order=scene_template_packet.render_order,
+            line_overlays=list(scene_template_packet.line_overlays),
+            filled_regions=list(scene_template_packet.filled_regions),
+            cuboid_instances=list(scene_template_packet.cuboid_instances),
+            cuboid_batches=[],
+            arrow_overlays=[],
+            render_order=list(scene_template_packet.render_order),
         )
+        self._append_annotation_primitives(packet, scenario)
+        return packet
 
     def _render_scene_packet_cpu(self,
                                  packet: CameraScenePacket,
@@ -1579,14 +2019,17 @@ class ScenarioRenderer:
         return canvas
 
     def _render_scene_packet_hybrid(self, packet: CameraScenePacket) -> np.ndarray:
+        use_fast_line_path = self.use_gpu_line_overlays and (self.quality_mode == "perf")
+        t_lower = time.perf_counter()
         lowered = self._lower_scene_packet(
             packet,
             include_filled_regions=self.use_gpu_filled_regions,
             include_cuboid_instances=self.use_gpu_cuboid_instances,
             include_cuboid_batches=self.use_gpu_cuboid_batches,
-            include_line_overlays=self.use_gpu_line_overlays,
+            include_line_overlays=self.use_gpu_line_overlays and (not use_fast_line_path),
             include_arrows=self.use_gpu_arrows,
         )
+        self._perf_add("lower_total_ms", (time.perf_counter() - t_lower) * 1000.0)
         canvas = np.zeros((packet.camera.height, packet.camera.width, 3), dtype=np.uint8)
         gpu_canvas = None
 
@@ -1638,7 +2081,9 @@ class ScenarioRenderer:
         if gpu_cuboid_source_kinds:
             opaque_batches.extend(self._filter_triangle_batches(lowered.cuboid_triangle_batches, gpu_cuboid_source_kinds))
         if opaque_batches:
+            t_opaque = time.perf_counter()
             opaque_rgba = self._rasterize_solid_triangle_batches(opaque_batches, packet.camera, return_torch=True)
+            self._perf_add("raster_opaque_ms", (time.perf_counter() - t_opaque) * 1000.0)
             gpu_canvas = self._composite_rgba_over_canvas_torch(gpu_canvas, opaque_rgba)
 
         if not self.use_gpu_line_overlays:
@@ -1665,31 +2110,75 @@ class ScenarioRenderer:
                 include_arrows=True,
             )
 
+        if use_fast_line_path:
+            fast_line_overlays = self._collect_line_overlays_for_gpu(packet)
+            overlay_rgba_fast = self._rasterize_line_overlays_fast(fast_line_overlays, packet.camera)
+            gpu_canvas = self._composite_rgba_over_canvas_torch(gpu_canvas, overlay_rgba_fast)
+
         overlay_source_kinds = set()
-        if self.use_gpu_line_overlays:
+        if self.use_gpu_line_overlays and (not use_fast_line_path):
             overlay_source_kinds.add("line_overlay")
         if self.use_gpu_arrows:
             overlay_source_kinds.add("arrow_overlay")
         if overlay_source_kinds:
             overlay_batches = self._filter_triangle_batches(lowered.overlay_triangle_batches, overlay_source_kinds)
+            t_overlay = time.perf_counter()
             overlay_rgba = self._rasterize_solid_triangle_batches(overlay_batches, packet.camera, return_torch=True)
+            self._perf_add("raster_overlay_ms", (time.perf_counter() - t_overlay) * 1000.0)
             gpu_canvas = self._composite_rgba_over_canvas_torch(gpu_canvas, overlay_rgba)
         if gpu_canvas is not None:
+            t_copy = time.perf_counter()
             if np.any(canvas):
                 torch, _ = self._lazy_import_torch_raster()
                 cpu_canvas_t = torch.as_tensor(canvas, dtype=torch.uint8, device=gpu_canvas.device)
-                mask = gpu_canvas.any(dim=-1)
+                mask = gpu_canvas.any(dim=-1).bool()
                 cpu_canvas_t[mask] = gpu_canvas[mask]
-                return self._to_numpy_rgb(cpu_canvas_t)
-            return self._to_numpy_rgb(gpu_canvas)
+                out = self._to_numpy_rgb(cpu_canvas_t)
+                self._perf_add("gpu_to_cpu_copy_ms", (time.perf_counter() - t_copy) * 1000.0)
+                return out
+            out = self._to_numpy_rgb(gpu_canvas)
+            self._perf_add("gpu_to_cpu_copy_ms", (time.perf_counter() - t_copy) * 1000.0)
+            return out
         return canvas
 
     def observe(self, scenario):
-        lidar_pos = np.zeros(3, dtype=np.float32)
-        lidar_yaw = scenario['ego_heading']
+        self._perf_reset()
+        t_obs = time.perf_counter()
+        lidar_pos, lidar_yaw = self._resolve_lidar_pose(scenario)
+        map_features, world_static_map = self._resolve_map_features_for_scene(scenario)
+        scene_id = scenario.get("scene_id", "__unknown_scene__")
+        scope = (scene_id, self.width, self.height, float(self.depth_max), self.quality_mode, bool(world_static_map))
+        if self._cache_scope != scope:
+            self._scene_static_cache.clear()
+            self._line_points_torch_cache.clear()
+            self._cache_scope = scope
+
         ret_dict = {}
-        scene_template_packet = self._build_scene_template_packet(scenario, lidar_pos)
+        if world_static_map:
+            t_static = time.perf_counter()
+            scene_template_packet = self._get_or_build_scene_static_cache_entry(
+                scenario=scenario,
+                lidar_pos=lidar_pos,
+                world_static_map=True,
+            )
+            self._perf_add("build_static_cache_ms", (time.perf_counter() - t_static) * 1000.0)
+        else:
+            t_static = time.perf_counter()
+            template = self._build_scene_template_packet(
+                map_features=map_features,
+                traffic_lights=scenario.get("traffic_lights", []),
+                lidar_pos=lidar_pos,
+                apply_distance_cull=True,
+            )
+            scene_template_packet = SceneStaticCacheEntry(
+                line_overlays=template.line_overlays,
+                filled_regions=template.filled_regions,
+                cuboid_instances=template.cuboid_instances,
+                render_order=template.render_order,
+            )
+            self._perf_add("build_static_cache_ms", (time.perf_counter() - t_static) * 1000.0)
         for cam_id, cam_model in self.camera_models.items():
+            t_build = time.perf_counter()
             packet = self._build_camera_scene_packet(
                 cam_id,
                 cam_model,
@@ -1698,6 +2187,7 @@ class ScenarioRenderer:
                 lidar_yaw,
                 scene_template_packet=scene_template_packet,
             )
+            self._perf_add("build_packet_ms", (time.perf_counter() - t_build) * 1000.0)
             if self._use_any_gpu_pass():
                 ret_dict[cam_id] = self._render_scene_packet_hybrid(packet)
             else:
@@ -1737,10 +2227,7 @@ class ScenarioRenderer:
             #     #     Wd, H_box = H_box, Wd
             #     # else:
 
-                
-
-
-
+        self._perf_add("observe_total_ms", (time.perf_counter() - t_obs) * 1000.0)
         return ret_dict
 
 
